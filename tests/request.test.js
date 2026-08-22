@@ -6,6 +6,8 @@ import { normalizeToolArguments } from '../lib/index.js'
 test('repairs missing pwsh description without changing other tools', () => {
   assert.equal(normalizeToolArguments('pwsh', '{"command":"Get-Date"}'), '{"command":"Get-Date","description":"Run PowerShell command"}')
   assert.equal(normalizeToolArguments('pwsh', '{"command":"Get-Date","description":"Read the date"}'), '{"command":"Get-Date","description":"Read the date"}')
+  assert.equal(normalizeToolArguments('write', '{"file_path":"out.md","content":"text","justification":"write the file"}'), '{"file_path":"out.md","content":"text"}')
+  assert.equal(normalizeToolArguments('write', '{"file_path":"out.md","content":"text","sandbox_permissions":"danger-full-access","justification":"write outside workspace"}'), '{"file_path":"out.md","content":"text","sandbox_permissions":"danger-full-access","justification":"write outside workspace"}')
   assert.equal(normalizeToolArguments('read', '{"path":"README.md"}'), '{"path":"README.md"}')
 })
 
