@@ -16,11 +16,13 @@ Features:
 
 ## Install
 
-From the dsh profile directory:
+From the dsh profile directory, install directly from GitHub:
 
 ```powershell
-dsh plugin --profile web add E:\Project\dsh-gemini-aistudio
+dsh plugin --profile web add https://github.com/Jyleaves/dsh-gemini-aistudio.git
 ```
+
+For local development, replace the GitHub URL with the local project directory.
 
 The plugin bundle is then included by the profile. The native provider route is `aistudio-gemini`.
 
