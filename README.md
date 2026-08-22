@@ -26,10 +26,10 @@ For local development, replace the GitHub URL with the local project directory.
 
 The plugin bundle is then included by the profile. The native provider route is `aistudio-gemini`.
 
-Set the API key in the environment visible to dsh:
+Create a key in the proxy's **API Key 管理** page first, then set it in the environment visible to dsh:
 
 ```powershell
-$env:AISTUDIO_API_KEY = 'your-local-proxy-token'
+$env:AISTUDIO_API_KEY = 'the key copied from the proxy UI'
 ```
 
 The bundle defaults to `http://127.0.0.1:8090` and enables Google Search. Select `aistudio-gemini` plus a Gemini model in dsh. Model discovery reads `/v1/models` and supplies context window, maximum output tokens, input modalities, and reasoning capability automatically.
