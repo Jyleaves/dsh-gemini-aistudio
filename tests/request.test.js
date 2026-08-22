@@ -1,6 +1,13 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { buildGeminiRequest } from '../lib/request.js'
+import { normalizeToolArguments } from '../lib/index.js'
+
+test('repairs missing pwsh description without changing other tools', () => {
+  assert.equal(normalizeToolArguments('pwsh', '{"command":"Get-Date"}'), '{"command":"Get-Date","description":"Run PowerShell command"}')
+  assert.equal(normalizeToolArguments('pwsh', '{"command":"Get-Date","description":"Read the date"}'), '{"command":"Get-Date","description":"Read the date"}')
+  assert.equal(normalizeToolArguments('read', '{"path":"README.md"}'), '{"path":"README.md"}')
+})
 
 test('builds native Google Search for a plain prompt', async () => {
   const request = await buildGeminiRequest({
