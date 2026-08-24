@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { buildGeminiRequest } from '../lib/request.js'
-import { normalizeToolArguments } from '../lib/index.js'
+import { buildGeminiRequest, buildOpenAIRequest } from '../lib/request.js'
+import { normalizeToolArguments, reasoningMetadata } from '../lib/index.js'
 
 test('repairs missing pwsh description without changing other tools', () => {
   assert.equal(normalizeToolArguments('pwsh', '{"command":"Get-Date"}'), '{"command":"Get-Date","description":"Run PowerShell command"}')
@@ -27,6 +27,30 @@ test('maps dsh reasoning effort to Gemini thinking level', async () => {
     messages: [{ role: 'user', content: [{ type: 'text', text: 'think' }] }],
   }, { googleSearch: false })
   assert.deepEqual(request.generationConfig.thinkingConfig, { thinkingLevel: 'MEDIUM' })
+})
+
+test('advertises selectable reasoning efforts with high as the default', () => {
+  assert.deepEqual(reasoningMetadata(), {
+    efforts: [
+      { id: 'minimal', name: 'Minimal' },
+      { id: 'low', name: 'Low' },
+      { id: 'medium', name: 'Medium' },
+      { id: 'high', name: 'High' },
+    ],
+    defaultEffort: 'high',
+  })
+  assert.equal(reasoningMetadata({ reasoning: false }), undefined)
+})
+
+test('forwards reasoning effort through OpenAI tool-call requests', async () => {
+  const request = await buildOpenAIRequest({
+    model: 'gemini-3.7-flash',
+    reasoningEffort: 'high',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'think' }] }],
+    tools: [{ name: 'read', description: 'read a file', parameters: { type: 'object' } }],
+  }, {})
+
+  assert.equal(request.reasoning_effort, 'high')
 })
 
 test('does not mix Google Search into Gemini function-tool turns', async () => {
