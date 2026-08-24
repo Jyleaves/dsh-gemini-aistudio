@@ -24,7 +24,7 @@ dsh plugin --profile web add https://github.com/Jyleaves/dsh-gemini-aistudio.git
 
 For local development, replace the GitHub URL with the local project directory.
 
-The plugin bundle is then included by the profile. It does not automatically create a dsh provider or model entry. The native provider route is `aistudio-gemini`; add the provider and each model manually in dsh settings.
+Restart dsh after installation. The bundle automatically mounts the native provider route `aistudio-gemini`, loads its browser upload control, and discovers models from the proxy. It does not replace DeepSeek or create a duplicate generic provider entry.
 
 Create a key in the proxy's **API Key 管理** page first, then set it in the environment visible to dsh:
 
@@ -32,9 +32,9 @@ Create a key in the proxy's **API Key 管理** page first, then set it in the en
 $env:AISTUDIO_API_KEY = 'the key copied from the proxy UI'
 ```
 
-The plugin defaults to `http://127.0.0.1:8090` and enables Google Search. After adding the provider manually, use dsh's model discovery to read `/v1/models`; it supplies context window, maximum output tokens, input modalities, and reasoning capability automatically.
+The plugin defaults to `http://127.0.0.1:8090` and enables Google Search. The native provider reads `/v1/models`; it supplies context window, maximum output tokens, input modalities, and the selectable `Minimal`, `Low`, `Medium`, and `High` reasoning efforts automatically. `High` is the default.
 
-If the dsh settings page does not show the native provider's models, add a custom provider manually:
+If you prefer dsh's generic OpenAI-compatible provider instead of the native plugin route, add one manually:
 
 | Field | Value |
 |---|---|
@@ -44,7 +44,7 @@ If the dsh settings page does not show the native provider's models, add a custo
 | API protocol | `openai-completions` |
 | API key | Any active local proxy key |
 
-After clicking **Get available models**, manually add `gemini-3.7-flash` (or another returned Gemini model). Set reasoning on, input modalities to `text,image`, context window to `1000000`, and maximum output tokens to `65536`.
+After clicking **Get available models**, select `gemini-3.7-flash` (or another returned Gemini model). Current proxy metadata supplies reasoning efforts and limits, so supported dsh versions should not require those fields to be re-entered by hand.
 
 Use the `上传原图 / PDF` control below the composer, or paste an image/PDF into the composer. After a successful upload, the plugin adds a private marker to the draft and shows `已上传`. The file is sent to Gemini only when the message is submitted. Normal dsh image attachments keep their original dsh behavior; use this control when exact source bytes are required.
 
@@ -65,7 +65,7 @@ After this project has an upstream Git remote, update it from the project direct
 .\update-dsh-gemini-aistudio.ps1
 ```
 
-The script refuses to update a dirty worktree and uses `git pull --ff-only`. Restart dsh after updating so the linked plugin bundle is reloaded.
+The script refuses to update a dirty worktree and uses `git pull --ff-only`. Restart dsh after updating so both the server adapter and browser bundle are reloaded.
 
 ## License
 

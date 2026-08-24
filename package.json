@@ -1,6 +1,6 @@
 {
   "name": "dsh-gemini-aistudio",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Native Gemini provider for DeepSeek Harness, with PDF path attachments and Google Search grounding.",
   "private": false,
   "type": "module",
@@ -9,9 +9,18 @@
     ".": "./lib/index.js",
     "./client": "./lib/client.js",
     "./request": "./lib/request.js",
-    "./pdf": "./lib/pdf.js"
+    "./pdf": "./lib/pdf.js",
+    "./package.json": "./package.json"
   },
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Jyleaves/dsh-gemini-aistudio.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Jyleaves/dsh-gemini-aistudio/issues"
+  },
+  "homepage": "https://github.com/Jyleaves/dsh-gemini-aistudio#readme",
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
@@ -30,6 +39,7 @@
     "lib",
     "cordis.patch.yml",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE",
     "update-dsh-gemini-aistudio.ps1",
     "update-dsh-gemini-aistudio.bat"

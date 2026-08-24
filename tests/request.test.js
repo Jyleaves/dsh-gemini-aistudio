@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { buildGeminiRequest, buildOpenAIRequest } from '../lib/request.js'
-import { normalizeToolArguments, reasoningMetadata } from '../lib/index.js'
+import { GeminiAdapter, normalizeToolArguments, reasoningMetadata } from '../lib/index.js'
 
 test('repairs missing pwsh description without changing other tools', () => {
   assert.equal(normalizeToolArguments('pwsh', '{"command":"Get-Date"}'), '{"command":"Get-Date","description":"Run PowerShell command"}')
@@ -40,6 +40,23 @@ test('advertises selectable reasoning efforts with high as the default', () => {
     defaultEffort: 'high',
   })
   assert.equal(reasoningMetadata({ reasoning: false }), undefined)
+})
+
+test('implements the dsh prepared-call adapter contract', async () => {
+  const adapter = new GeminiAdapter({
+    provider: 'aistudio-gemini',
+    baseURL: 'http://127.0.0.1:8090',
+    pdf: { enabled: true },
+  })
+  adapter.resolveModel = async (provider, model) => ({ provider, id: model, name: model })
+  adapter.stream = async function* () { yield { type: 'finish', reason: { kind: 'stop' } } }
+
+  const prepared = await adapter.prepareCall('aistudio-gemini', 'gemini-3.7-flash')
+  assert.equal(prepared.model.provider, 'aistudio-gemini')
+  assert.equal(prepared.model.id, 'gemini-3.7-flash')
+  assert.deepEqual(await Array.fromAsync(prepared.stream({})), [
+    { type: 'finish', reason: { kind: 'stop' } },
+  ])
 })
 
 test('forwards reasoning effort through OpenAI tool-call requests', async () => {

@@ -1,1 +1,5 @@
-[]
+# Mount the native provider and its client upload control when this package is
+# included in a dsh profile's bundle list.
+- insert:
+    - id: gemini-aistudio
+      name: dsh-gemini-aistudio
