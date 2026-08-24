@@ -5,9 +5,12 @@ Native Gemini provider for DeepSeek Harness. It is isolated under the provider r
 Features:
 
 - Uses the proxy's native `/v1beta/models/{model}:streamGenerateContent` endpoint.
-- Sends dsh images as native Gemini `inlineData`.
-- Adds a dsh upload control for original images and PDFs. These uploads bypass dsh's image normalization and are attached as their original bytes.
-- Supports pasting or dragging a PDF into the composer, including Windows Explorer clipboard paths; the upload row shows success, failure, and removal.
+- Sends dsh's native image attachments as Gemini `inlineData`, preserving dsh's
+  thumbnail and attachment lifecycle.
+- Adds `添加图片` and `添加 PDF` to the composer's existing plus menu. Images use
+  dsh's native attachment path; PDFs are streamed through the plugin endpoint.
+- Supports pasting PDFs into the composer, including Windows Explorer clipboard
+  paths.
 - Detects a PDF path in the latest user message and sends it as native `application/pdf` inline data.
 - Caches PDF bytes by path, size, and modification time, so account rotation does not reread the local file.
 - Rejects oversized or excessively long PDFs before network upload.
@@ -26,13 +29,15 @@ For local development, replace the GitHub URL with the local project directory.
 
 Restart dsh after installation. The bundle automatically mounts the native provider route `aistudio-gemini`, loads its browser upload control, and discovers models from the proxy. It does not replace DeepSeek or create a duplicate generic provider entry.
 
-Create a key in the proxy's **API Key 管理** page first, then set it in the environment visible to dsh:
+Create a key in Asteria's **API Key 管理** page first. The plugin resolves the
+credential reference stored by dsh and accepts either `GEMINI_AISTUDIO_API_KEY`
+or `AISTUDIO_API_KEY`. An environment variable is still supported when desired:
 
 ```powershell
 $env:AISTUDIO_API_KEY = 'the key copied from the proxy UI'
 ```
 
-The plugin defaults to `http://127.0.0.1:8090` and enables Google Search. The native provider reads `/v1/models`; it supplies context window, maximum output tokens, input modalities, and the selectable `Minimal`, `Low`, `Medium`, and `High` reasoning efforts automatically. `High` is the default.
+The plugin defaults to `http://127.0.0.1:8080` and enables Google Search. The native provider reads `/v1/models`; it supplies context window, maximum output tokens, input modalities, and the selectable `Minimal`, `Low`, `Medium`, and `High` reasoning efforts automatically. `High` is the default.
 
 If you prefer dsh's generic OpenAI-compatible provider instead of the native plugin route, add one manually:
 
@@ -40,13 +45,36 @@ If you prefer dsh's generic OpenAI-compatible provider instead of the native plu
 |---|---|
 | Provider ID | `gemini-aistudio` |
 | Display name | `Google AI Studio` |
-| API address | `http://127.0.0.1:8090/v1` |
+| API address | `http://127.0.0.1:8080/v1` |
 | API protocol | `openai-completions` |
 | API key | Any active local proxy key |
 
-After clicking **Get available models**, select `gemini-3.7-flash` (or another returned Gemini model). Current proxy metadata supplies reasoning efforts and limits, so supported dsh versions should not require those fields to be re-entered by hand.
+The native `Google AI Studio (native)` route is recommended. Current dsh generic
+OpenAI discovery imports only model IDs, names, context windows, and output
+limits; its discovery contract does not carry provider-specific image or
+reasoning metadata. The native route bypasses that restricted contract and
+declares both capabilities explicitly.
 
-Use the `上传原图 / PDF` control below the composer, paste an image/PDF, paste a copied local file path, or drag a supported file onto the upload row. After a successful upload, the plugin adds a private marker to the draft and shows `已上传`. The file is sent to Gemini only when the message is submitted. Normal dsh image attachments keep their original dsh behavior; use this control when exact source bytes are required.
+Users who deliberately need the generic provider can opt into the versioned
+dsh `0.1.1-rc.2` discovery patch. It backs up every touched host file, refuses
+unknown builds, and can be restored:
+
+```powershell
+.\patch-dsh-model-discovery.ps1 -CheckOnly
+.\patch-dsh-model-discovery.ps1
+# Restore the original dsh files when needed:
+.\patch-dsh-model-discovery.ps1 -Restore
+```
+
+Restart `dsh web`, fetch the model list again, and save it. The imported model
+rows will then retain image input and per-model reasoning efforts in addition
+to their names and capacities. A dsh upgrade replaces host package files, so
+rerun `-CheckOnly`; never force this patch onto an unsupported version.
+
+Open the composer's plus menu and choose `添加图片` or `添加 PDF`. Pasted images
+also use dsh's native thumbnail attachment. A PDF is sent to Gemini only when
+the message is submitted; a copied local PDF path remains supported for Windows
+Explorer compatibility.
 
 When dsh supplies custom tools such as `read`, `edit`, or `bash`, the plugin uses `/v1/chat/completions` for that turn so tool calls and tool results can complete without Gemini's native AI Studio replay permission error. Google Search is kept for plain native Gemini turns; it is not implicitly mixed into custom-tool turns.
 

@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { buildGeminiRequest, buildOpenAIRequest } from '../lib/request.js'
-import { GeminiAdapter, normalizeToolArguments, reasoningMetadata } from '../lib/index.js'
+import { GeminiAdapter, normalizeToolArguments, reasoningMetadata, shouldUseOpenAICompatibility } from '../lib/index.js'
 
 test('repairs missing pwsh description without changing other tools', () => {
   assert.equal(normalizeToolArguments('pwsh', '{"command":"Get-Date"}'), '{"command":"Get-Date","description":"Run PowerShell command"}')
@@ -9,6 +9,85 @@ test('repairs missing pwsh description without changing other tools', () => {
   assert.equal(normalizeToolArguments('write', '{"file_path":"out.md","content":"text","justification":"write the file"}'), '{"file_path":"out.md","content":"text"}')
   assert.equal(normalizeToolArguments('write', '{"file_path":"out.md","content":"text","sandbox_permissions":"danger-full-access","justification":"write outside workspace"}'), '{"file_path":"out.md","content":"text","sandbox_permissions":"danger-full-access","justification":"write outside workspace"}')
   assert.equal(normalizeToolArguments('read', '{"path":"README.md"}'), '{"path":"README.md"}')
+  assert.equal(normalizeToolArguments('todo_write', '{"todos":[null,{"content":"Test","status":"pending"},null]}'), '{"todos":[{"content":"Test","status":"pending"}]}')
+})
+
+test('keeps image and PDF turns on the native Gemini route even when tools are present', () => {
+  const tools = [{ name: 'read', description: 'read a file', parameters: { type: 'object' } }]
+  assert.equal(shouldUseOpenAICompatibility({ messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }], tools }), true)
+  assert.equal(shouldUseOpenAICompatibility({ messages: [{ role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'image-1' } }] }], tools }), false)
+  assert.equal(shouldUseOpenAICompatibility({ messages: [{ role: 'user', content: [{ type: 'text', text: '[[dsh-gemini-file:C:\\tmp\\report.pdf]]' }] }], tools }), false)
+})
+
+test('model discovery falls back without a credential and still declares vision and reasoning', async () => {
+  const adapter = new GeminiAdapter({
+    provider: 'aistudio-gemini',
+    baseURL: 'http://127.0.0.1:8080',
+    models: ['gemini-3.7-flash'],
+    pdf: { enabled: true },
+    resolveApiKey: async () => undefined,
+  })
+  const [model] = await adapter.listModels('aistudio-gemini')
+  assert.deepEqual(model.inputModalities, ['text', 'image'])
+  assert.equal(model.reasoning.defaultEffort, 'high')
+})
+
+test('imports complete model metadata from the proxy catalog', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => ({
+    ok: true,
+    json: async () => ({
+      data: [{
+        id: 'gemini-3.7-flash',
+        name: 'Gemini 3.7 Flash',
+        input_modalities: ['text', 'image'],
+        context_window: 1_000_000,
+        max_output_tokens: 65_536,
+        reasoning_efforts: ['minimal', 'low', 'medium', 'high'],
+        default_reasoning_effort: 'high',
+      }],
+    }),
+  })
+  try {
+    const adapter = new GeminiAdapter({
+      provider: 'aistudio-gemini',
+      baseURL: 'http://127.0.0.1:8080',
+      models: ['gemini-3.7-flash'],
+      pdf: { enabled: true },
+      resolveApiKey: async () => 'test-key',
+    })
+    const [model] = await adapter.listModels('aistudio-gemini')
+    assert.equal(model.id, 'gemini-3.7-flash')
+    assert.equal(model.name, 'Gemini 3.7 Flash')
+    assert.deepEqual(model.inputModalities, ['text', 'image'])
+    assert.deepEqual(model.context, { contextWindow: 1_000_000 })
+    assert.equal(model.defaultMaxTokens, 65_536)
+    assert.deepEqual(model.reasoning.efforts.map((effort) => effort.id), ['minimal', 'low', 'medium', 'high'])
+    assert.equal(model.reasoning.defaultEffort, 'high')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('coalesces concurrent model discovery requests', async () => {
+  const originalFetch = globalThis.fetch
+  let calls = 0
+  globalThis.fetch = async () => {
+    calls += 1
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    return { ok: true, json: async () => ({ data: [{ id: 'gemini-3.7-flash' }] }) }
+  }
+  try {
+    const adapter = new GeminiAdapter({
+      provider: 'aistudio-gemini', baseURL: 'http://127.0.0.1:8080',
+      models: ['gemini-3.7-flash'], pdf: { enabled: true },
+      resolveApiKey: async () => 'test-key',
+    })
+    await Promise.all([adapter.fetchModels(), adapter.fetchModels(), adapter.fetchModels()])
+    assert.equal(calls, 1)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
 })
 
 test('builds native Google Search for a plain prompt', async () => {

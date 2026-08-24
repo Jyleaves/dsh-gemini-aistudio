@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-08-25
+
+### Added
+
+- Add `添加图片` and `添加 PDF` entries to dsh's existing composer plus menu.
+- Declare image input and selectable reasoning efforts even when model discovery
+  temporarily falls back to the built-in catalog.
+- Add an opt-in, version-locked, reversible patch for dsh `0.1.1-rc.2` users
+  who need generic-provider discovery to retain image and reasoning metadata.
+
+### Changed
+
+- Let dsh own image paste and upload so images retain the native thumbnail,
+  validation, persistence, and message attachment lifecycle.
+- Restrict the plugin upload path to PDFs and keep the attachment UI inside the
+  existing plus menu instead of rendering a separate composer control.
+- Resolve credentials from dsh's credential service, accepting both
+  `GEMINI_AISTUDIO_API_KEY` and `AISTUDIO_API_KEY` references.
+- Resolve the attachment service at request time and use port `8080` as the
+  default local Asteria endpoint.
+- Coalesce concurrent model-discovery calls so one model selector refresh sends
+  only one request to Asteria.
+
+### Fixed
+
+- Keep image and PDF turns on native Gemini even when dsh exposes custom tools.
+- Avoid failing the whole native provider during model discovery when a key has
+  not yet been configured.
+- Accept both camel-case and snake-case Asteria model metadata.
+- Cover complete proxy-catalog metadata import, including snake-case input
+  modalities, with a regression test.
+- Defensively discard null todo entries returned by older proxy versions while
+  preserving the proxy's general tool-argument repair as the primary fix.
+
 ## [0.1.2] - 2026-08-24
 
 ### Added
@@ -60,6 +94,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Repair missing PowerShell tool descriptions and remove stray write/edit
   justifications before forwarding tool schemas to Gemini.
 
-[Unreleased]: https://github.com/Jyleaves/dsh-gemini-aistudio/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/Jyleaves/dsh-gemini-aistudio/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/Jyleaves/dsh-gemini-aistudio/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/Jyleaves/dsh-gemini-aistudio/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/Jyleaves/dsh-gemini-aistudio/compare/v0.1.0...v0.1.1

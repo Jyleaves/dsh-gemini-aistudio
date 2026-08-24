@@ -1,7 +1,7 @@
 {
   "name": "dsh-gemini-aistudio",
-  "version": "0.1.2",
-  "description": "Native Gemini provider for DeepSeek Harness, with PDF path attachments and Google Search grounding.",
+  "version": "0.1.3",
+  "description": "Native Gemini provider for DeepSeek Harness, with native image attachments, PDF input, tools, and reasoning controls.",
   "private": false,
   "type": "module",
   "main": "./lib/index.js",
@@ -41,6 +41,7 @@
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
+    "patch-dsh-model-discovery.ps1",
     "update-dsh-gemini-aistudio.ps1",
     "update-dsh-gemini-aistudio.bat"
   ],
