@@ -7,7 +7,7 @@ Features:
 - Uses the proxy's native `/v1beta/models/{model}:streamGenerateContent` endpoint.
 - Sends dsh images as native Gemini `inlineData`.
 - Adds a dsh upload control for original images and PDFs. These uploads bypass dsh's image normalization and are attached as their original bytes.
-- Supports pasting a PDF from the clipboard into the composer; the upload row shows success, failure, and removal.
+- Supports pasting or dragging a PDF into the composer, including Windows Explorer clipboard paths; the upload row shows success, failure, and removal.
 - Detects a PDF path in the latest user message and sends it as native `application/pdf` inline data.
 - Caches PDF bytes by path, size, and modification time, so account rotation does not reread the local file.
 - Rejects oversized or excessively long PDFs before network upload.
@@ -46,7 +46,7 @@ If you prefer dsh's generic OpenAI-compatible provider instead of the native plu
 
 After clicking **Get available models**, select `gemini-3.7-flash` (or another returned Gemini model). Current proxy metadata supplies reasoning efforts and limits, so supported dsh versions should not require those fields to be re-entered by hand.
 
-Use the `上传原图 / PDF` control below the composer, or paste an image/PDF into the composer. After a successful upload, the plugin adds a private marker to the draft and shows `已上传`. The file is sent to Gemini only when the message is submitted. Normal dsh image attachments keep their original dsh behavior; use this control when exact source bytes are required.
+Use the `上传原图 / PDF` control below the composer, paste an image/PDF, paste a copied local file path, or drag a supported file onto the upload row. After a successful upload, the plugin adds a private marker to the draft and shows `已上传`. The file is sent to Gemini only when the message is submitted. Normal dsh image attachments keep their original dsh behavior; use this control when exact source bytes are required.
 
 When dsh supplies custom tools such as `read`, `edit`, or `bash`, the plugin uses `/v1/chat/completions` for that turn so tool calls and tool results can complete without Gemini's native AI Studio replay permission error. Google Search is kept for plain native Gemini turns; it is not implicitly mixed into custom-tool turns.
 
@@ -54,7 +54,11 @@ PDF paths are still detected in the latest user message for compatibility. The c
 
 ## Limits
 
-The default PDF limit is 20 MiB and 300 pages. The upload control accepts up to 32 MiB, while the Gemini media cache follows the configured `pdf.maxBytes` limit. A PDF is still sent inline to the proxy; it is not uploaded to a persistent Google Files URI. The proxy may spend time rebuilding AI Studio state after an account switch, but this plugin avoids rereading and re-encoding the local file for each retry.
+The default PDF and upload limit is 20 MiB and 300 pages. A PDF is still sent inline to the proxy; it is not uploaded to a persistent Google Files URI. Large encoded files bypass the long-lived in-memory cache, uploads are streamed to disk, and stale temporary uploads are removed after 24 hours. The proxy may spend time rebuilding AI Studio state after an account switch, but a request body is reused across the proxy's account retries.
+
+Gemini thinking and visible text share the request's maximum output-token budget. Keep the plugin's normal model limit when using `High`; manually reducing it to tens or hundreds of tokens can leave room for only a very short visible answer after reasoning.
+
+The adapter forwards dsh function tools, but autonomous visual QA still depends on the tools installed in the active dsh profile. For a presentation workflow, expose a renderer plus an image-inspection tool and explicitly require the agent to render and inspect the result before completion; the provider cannot invent a screenshot or PDF-reading tool that dsh did not supply.
 
 ## Update
 
