@@ -249,6 +249,53 @@ test('repairs nested arrays for boolean, integer, enum, and object item schemas'
   )
 })
 
+test('conservatively removes streamed JSON leakage after an unambiguous enum value', () => {
+  const schema = {
+    type: 'object',
+    required: ['todos'],
+    properties: {
+      todos: {
+        type: 'array',
+        items: {
+          type: 'object',
+          required: ['content', 'status'],
+          properties: {
+            content: { type: 'string' },
+            status: { type: 'string', enum: ['pending', 'in_progress', 'completed'] },
+          },
+        },
+      },
+    },
+  }
+  assert.deepEqual(
+    normalizeToolArguments('todo_write', {
+      todos: [{ content: 'Collect sources', status: 'in_progress\"},{\"content:' }],
+    }, schema),
+    { todos: [{ content: 'Collect sources', status: 'in_progress' }] },
+  )
+  assert.deepEqual(
+    normalizeToolArguments('todo_write', {
+      todos: [{ content: 'Collect sources', status: 'in_progress_extra' }],
+    }, schema),
+    { todos: [{ content: 'Collect sources', status: 'in_progress_extra' }] },
+  )
+})
+
+test('preserves user relative-time constraints in Gemini search arguments automatically', () => {
+  const raw = JSON.stringify({ query: 'AI chip supply chain news August 2026' })
+  const normalized = JSON.parse(normalizeToolArguments('gemini_web_search', raw, {
+    type: 'object',
+    required: ['query'],
+    properties: { query: { type: 'string' } },
+  }, {
+    latestUserText: '帮我核实过去24小时最重要的消息，不要拿旧闻代替。',
+    now: new Date(2026, 7, 26, 12, 30, 0),
+  }))
+  assert.match(normalized.query, /Relative-time wording from the user: "过去24小时"/)
+  assert.match(normalized.query, /Exact requested rolling window for "过去24小时": 2026-08-25/)
+  assert.match(normalized.query, /through 2026-08-26/)
+})
+
 test('fills required description fields recursively from any tool schema', () => {
   const schema = {
     type: 'object',
@@ -337,6 +384,9 @@ test('adds general agent continuation guidance whenever tools are available', ()
   const prepared = prepareAgentExecution({ system: 'base', tools: [{ name: 'read' }] })
   assert.match(prepared.system, /call that tool instead of ending the turn with a plan/)
   assert.match(prepared.system, /Keep private analysis and reasoning out of normal answer text/)
+  assert.match(prepared.system, /check the supplied JSON Schema/)
+  assert.match(prepared.system, /failed tool result is not progress/)
+  assert.match(prepared.system, /File existence alone proves neither content quality nor format correctness/)
   assert.doesNotMatch(prepared.system, /Task-list progress rules/)
   assert.equal(prepareAgentExecution({ system: 'base', tools: [] }).system, 'base')
 })
@@ -556,6 +606,9 @@ test('keeps first-pass Gemini native search and removes legacy web tools', () =>
   assert.match(prepared.system, /Never replace an unverified exact target/)
   assert.match(prepared.system, /quoted-name discovery lookup/)
   assert.match(prepared.system, /primary page establishes the final fact/)
+  assert.match(prepared.system, /Copy every cited URL exactly/)
+  assert.match(prepared.system, /generic home page.*is not evidence/)
+  assert.match(prepared.system, /publication dates and event dates/)
   assert.match(prepared.system, /non-network local dsh tools for deterministic computation/)
   assert.match(prepared.system, /workspace and file inspection, transformations, and result verification/)
   assert.match(prepared.system, /Do not use shell commands, package-manager commands, scripts, or local browser tools to access public/)
@@ -617,6 +670,21 @@ test('suppresses only a repeatedly invalid tool while preserving other tools', (
   assert.match(prepared.system, /subagent/)
 })
 
+test('anchors relative-date web research to the runtime date instead of model memory', () => {
+  const prepared = prepareSearchConvergence({
+    system: 'base',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'What happened in the past 24 hours?' }] }],
+    tools: [{ name: 'gemini_web_search', parameters: { type: 'object' } }],
+  }, 6, new Date(2026, 7, 26, 12, 0, 0))
+  assert.match(prepared.system, /Runtime date anchor for this request: 2026-08-26/)
+  assert.match(prepared.system, /Exact requested rolling window for "past 24 hours": 2026-08-25/)
+  assert.match(prepared.system, /Put the resulting absolute date range in the search query/)
+  assert.match(prepared.system, /Do not guess a month, year, or cutoff from model memory/)
+  const search = prepared.tools.find((tool) => tool.name === 'gemini_web_search')
+  assert.match(search.description, /Runtime date: 2026-08-26/)
+  assert.match(search.description, /Exact requested rolling window for "past 24 hours": 2026-08-25/)
+})
+
 test('provides actionable recovery for common dsh tool failures without guessing data', () => {
   const cases = [
     {
@@ -648,6 +716,16 @@ test('provides actionable recovery for common dsh tool failures without guessing
       tool: 'gemini_web_search',
       error: 'Error: tool "gemini_web_search" returned invalid output: value is not lossless JSON',
       expected: /non-empty, precise query/,
+    },
+    {
+      tool: 'wait_agent',
+      error: 'Error: unknown job 5962b031',
+      expected: /runtime no longer recognizes/,
+    },
+    {
+      tool: 'gemini_web_search',
+      error: 'Error: Gemini native web lookup returned HTTP 500: The caller does not have permission',
+      expected: /retry the same substantive lookup at most once/,
     },
   ]
   for (const [index, entry] of cases.entries()) {
@@ -797,6 +875,7 @@ test('registers Gemini native search with provider-valid JSON Schema', () => {
       query: { type: 'string', description: 'One precise web lookup request. Include complete URLs and exact identifiers when available.' },
     },
   })
+  assert.deepEqual(search.output.schema.required, ['text', 'sources', 'supports', 'model', 'query', 'googleSearch', 'urlContext'])
 })
 
 test('Gemini native lookup enables Google Search and URL Context together', async () => {
@@ -804,17 +883,77 @@ test('Gemini native lookup enables Google Search and URL Context together', asyn
   let captured
   globalThis.fetch = async (url, init) => {
     captured = { url, body: JSON.parse(init.body) }
-    return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: 'grounded result' }] } }] }), { status: 200, headers: { 'content-type': 'application/json' } })
+    return new Response(JSON.stringify({
+      candidates: [{
+        content: { parts: [{ text: 'grounded result' }] },
+        urlContextMetadata: { urlMetadata: [{ retrievedUrl: 'https://example.com/direct', title: 'Direct page' }] },
+        groundingMetadata: {
+          groundingChunks: [
+            { web: { uri: 'https://example.net/report', title: 'Independent report' } },
+            { web: { uri: 'https://example.com/direct', title: 'Duplicate direct page' } },
+          ],
+          groundingSupports: [{
+            segment: { text: 'The directly supported claim.' },
+            groundingChunkIndices: [0, 1],
+          }],
+        },
+      }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } })
+  }
+  try {
+    const result = await runNativeWebLookup({
+      baseURL: 'http://127.0.0.1:8080',
+      searchModel: 'gemini-search-lite',
+      models: ['gemini-test'],
+      resolveApiKey: async () => 'test-key',
+    }, 'https://github.com/example/provider', undefined)
+    assert.deepEqual(captured.body.tools, [{ googleSearch: {} }, { urlContext: {} }])
+    assert.match(captured.url, /gemini-search-lite:generateContent$/)
+    assert.match(captured.body.contents[0].parts[0].text, /Copy source URLs exactly/)
+    assert.match(captured.body.contents[0].parts[0].text, /must actually invoke Google Search/)
+    assert.match(captured.body.contents[0].parts[0].text, /do not answer from model memory/)
+    assert.match(captured.body.contents[0].parts[0].text, /partial, conflicting, or unsupported leads/)
+    assert.match(captured.body.contents[0].parts[0].text, /Runtime date anchor: \d{4}-\d{2}-\d{2}/)
+    assert.match(captured.body.contents[0].parts[0].text, /state the absolute date range used/)
+    assert.equal(result.text, 'grounded result')
+    assert.deepEqual(result.sources, [
+      { uri: 'https://example.com/direct', title: 'Direct page', kind: 'url_context' },
+      { uri: 'https://example.net/report', title: 'Independent report', kind: 'google_search' },
+    ])
+    assert.deepEqual(result.supports, [{
+      claim: 'The directly supported claim.',
+      sourceUris: ['https://example.net/report', 'https://example.com/direct'],
+    }])
+    assert.equal(result.urlContext, true)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('plain native web research uses Google Search without empty URL Context', async () => {
+  const originalFetch = globalThis.fetch
+  let capturedBody
+  let capturedUrl
+  globalThis.fetch = async (url, init) => {
+    capturedUrl = String(url)
+    capturedBody = JSON.parse(init.body)
+    return new Response(JSON.stringify({
+      candidates: [{
+        content: { parts: [{ text: 'grounded search result' }] },
+        groundingMetadata: { groundingChunks: [{ web: { uri: 'https://example.com/news', title: 'News' } }] },
+      }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } })
   }
   try {
     const result = await runNativeWebLookup({
       baseURL: 'http://127.0.0.1:8080',
       models: ['gemini-test'],
       resolveApiKey: async () => 'test-key',
-    }, 'https://github.com/example/provider', undefined)
-    assert.deepEqual(captured.body.tools, [{ googleSearch: {} }, { urlContext: {} }])
-    assert.match(captured.url, /gemini-test:generateContent$/)
-    assert.equal(result.text, 'grounded result')
+    }, 'latest semiconductor news', undefined, 'gemini-user-selected')
+    assert.deepEqual(capturedBody.tools, [{ googleSearch: {} }])
+    assert.match(capturedUrl, /gemini-user-selected:generateContent$/)
+    assert.equal(result.model, 'gemini-user-selected')
+    assert.equal(result.urlContext, false)
   } finally {
     globalThis.fetch = originalFetch
   }
@@ -833,6 +972,57 @@ test('rejects an empty Gemini native lookup before producing non-lossless output
       (error) => error?.code === 'INVALID_ARGS' && /non-empty query/.test(error.message),
     )
     assert.equal(called, false)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('rejects native lookup text that has no provider grounding URLs', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    candidates: [{ content: { parts: [{ text: 'plausible but ungrounded result' }] } }],
+  }), { status: 200, headers: { 'content-type': 'application/json' } })
+  try {
+    await assert.rejects(
+      runNativeWebLookup({
+        baseURL: 'http://127.0.0.1:8080',
+        models: ['gemini-test'],
+        resolveApiKey: async () => 'test-key',
+      }, 'verify a current claim', undefined),
+      /without grounding source URLs/,
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('falls back once when the preferred search model returns ungrounded text', async () => {
+  const originalFetch = globalThis.fetch
+  const requestedModels = []
+  globalThis.fetch = async (url) => {
+    requestedModels.push(decodeURIComponent(String(url).match(/models\/([^:]+):generateContent/)?.[1] ?? ''))
+    if (requestedModels.length === 1) {
+      return new Response(JSON.stringify({
+        candidates: [{ content: { parts: [{ text: 'fast but ungrounded' }] } }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    return new Response(JSON.stringify({
+      candidates: [{
+        content: { parts: [{ text: 'grounded fallback' }] },
+        groundingMetadata: { groundingChunks: [{ web: { uri: 'https://example.org/source', title: 'Source' } }] },
+      }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } })
+  }
+  try {
+    const result = await runNativeWebLookup({
+      baseURL: 'http://127.0.0.1:8080',
+      searchModel: 'gemini-fast',
+      searchFallbackModel: 'gemini-grounded',
+      resolveApiKey: async () => 'test-key',
+    }, 'verify a current claim', undefined)
+    assert.deepEqual(requestedModels, ['gemini-fast', 'gemini-grounded'])
+    assert.equal(result.model, 'gemini-grounded')
+    assert.equal(result.sources[0].uri, 'https://example.org/source')
   } finally {
     globalThis.fetch = originalFetch
   }
@@ -1018,9 +1208,13 @@ test('emits at most one Gemini native search call per model response', async () 
 
   validateStrictStream(chunks)
   const calls = chunks.filter((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call').map((chunk) => chunk.block)
-  assert.deepEqual(calls, [
-    { type: 'tool-call', id: 'search_1', name: 'gemini_web_search', arguments: '{"query":"first"}' },
-  ])
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].id, 'search_1')
+  assert.equal(calls[0].name, 'gemini_web_search')
+  const query = JSON.parse(calls[0].arguments).query
+  assert.match(query, /^first/)
+  assert.match(query, /Relative-time wording from the user: "current"/)
+  assert.doesNotMatch(query, /Exact requested rolling window/)
 })
 
 test('preserves native function-call thought signatures without swallowing conversion errors', async () => {

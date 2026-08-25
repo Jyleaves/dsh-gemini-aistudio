@@ -14,7 +14,8 @@ Features:
 - Detects a PDF path in the latest user message and sends it as native `application/pdf` inline data.
 - Caches PDF bytes by path, size, and modification time, so account rotation does not reread the local file.
 - Rejects oversized or excessively long PDFs before network upload.
-- Sends Gemini's native `googleSearch` tool when enabled.
+- Provides a grounded `gemini_web_search` tool backed by Gemini native Google
+  Search, adding URL Context only for explicit public URLs.
 - Routes dsh custom function-tool turns through the proxy's OpenAI-compatible endpoint, because AI Studio's native function-result replay is unstable for this account bridge. Plain Gemini turns keep the native endpoint.
 
 ## Install
@@ -38,6 +39,18 @@ $env:AISTUDIO_API_KEY = 'the key copied from the proxy UI'
 ```
 
 The plugin defaults to `http://127.0.0.1:8080` and enables Google Search. The native provider reads `/v1/models`; it supplies context window, maximum output tokens, input modalities, and the selectable `Minimal`, `Low`, `Medium`, and `High` reasoning efforts automatically. `High` is the default.
+
+Native web lookup inherits the Gemini model selected for the current dsh
+conversation. This is resolved from the tool execution's own agent context, so
+concurrent conversations using different models do not affect one another. A
+lookup without at
+least one provider grounding URL is rejected rather than exposed as verified
+web evidence. Relative requests such as “today”, “latest”, or “the past N days”
+receive the runtime date and time zone automatically; explicit rolling
+durations are converted to absolute windows without forcing vague “recent”
+requests into a fixed 24-hour range. Advanced deployments can explicitly set
+`searchModel` to override the conversation model, set `searchFallbackModel` for
+a one-time fallback, or adjust `searchMaxCallsPerTurn` in plugin configuration.
 
 If you prefer dsh's generic OpenAI-compatible provider instead of the native plugin route, add one manually:
 

@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-08-26
+
+### Added
+
+- Add runtime date and time-zone anchoring for time-sensitive web research,
+  including computed rolling windows for explicit relative durations such as
+  the past N hours, days, weeks, months, or years.
+- Return Gemini grounding source URLs and claim-to-source mappings from native
+  web lookup results so the agent can trace material claims to provider
+  evidence.
+
+### Changed
+
+- Inherit the current dsh conversation's selected Gemini model for native web
+  lookup. Keep `searchModel` and `searchFallbackModel` as explicit operator
+  overrides instead of silently forcing 3.5 or 3.7 across all conversations.
+- Enable native Google Search for ordinary research and add URL Context only
+  when the query contains an explicit public URL.
+- Raise the per-turn native search budget from four to six while retaining
+  duplicate-query convergence and per-tool failure suppression.
+- Preserve evidence status across official statements, attributed analysis,
+  channel checks, rumors, and model inference; do not synthesize unsupported
+  causal relationships or company actions from separate reports.
+
+### Fixed
+
+- Reject search-like model prose that has no provider grounding URL instead of
+  presenting it as verified web evidence.
+- Preserve user relative-time constraints in the actual search-tool arguments
+  even when Gemini initially emits only a broad month or year.
+- Repair streamed JSON leakage after an unambiguous enum value without fuzzy
+  coercion of genuinely invalid enum strings.
+- Recover safely from stale agent job identifiers and transient native-search
+  provider failures without infinite retries or treating errors as evidence.
+
+### Tests
+
+- Add regression coverage for dynamic time windows, grounded-source extraction,
+  claim mapping, conditional URL Context, source-less response rejection,
+  per-conversation model inheritance, explicit model fallback, enum leakage,
+  and stale-job recovery.
+- Verify against Asteria's raw AI Studio exchange that `gemini-3.5-flash`
+  executes Google Search and returns grounding chunks/supports; the missing
+  sources were caused by proxy response-field loss, not the selected model.
+
 ## [0.1.7] - 2026-08-25
 
 ### Changed
@@ -254,7 +299,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Repair missing PowerShell tool descriptions and remove stray write/edit
   justifications before forwarding tool schemas to Gemini.
 
-[Unreleased]: https://github.com/Jyleaves/dsh-gemini-aistudio/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/Jyleaves/dsh-gemini-aistudio/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/Jyleaves/dsh-gemini-aistudio/compare/v0.1.7...v0.1.8
+[0.1.7]: https://github.com/Jyleaves/dsh-gemini-aistudio/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/Jyleaves/dsh-gemini-aistudio/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/Jyleaves/dsh-gemini-aistudio/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/Jyleaves/dsh-gemini-aistudio/compare/v0.1.3...v0.1.4
