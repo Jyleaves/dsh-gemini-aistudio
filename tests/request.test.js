@@ -1,15 +1,147 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { buildGeminiRequest, buildOpenAIRequest } from '../lib/request.js'
-import { GeminiAdapter, normalizeToolArguments, reasoningMetadata, shouldUseOpenAICompatibility } from '../lib/index.js'
+import { GeminiAdapter, apply, normalizeToolArguments, prepareSearchConvergence, reasoningMetadata, runNativeWebLookup, shouldUseOpenAICompatibility } from '../lib/index.js'
+
+function streamResponse(chunks) {
+  const encoder = new TextEncoder()
+  return new Response(new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
+      controller.close()
+    },
+  }), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+}
+
+function adapterForStream(overrides = {}) {
+  return new GeminiAdapter({
+    provider: 'aistudio-gemini',
+    baseURL: 'http://127.0.0.1:8080',
+    models: ['gemini-test'],
+    pdf: { enabled: true },
+    googleSearch: false,
+    resolveApiKey: async () => 'test-key',
+    ...overrides,
+  })
+}
+
+function validateStrictStream(chunks) {
+  const open = new Map()
+  let usageSeen = false
+  let finished = false
+  for (const chunk of chunks) {
+    assert.equal(finished, false, `${chunk.type} emitted after finish`)
+    if (chunk.type === 'block-start') {
+      assert.equal(open.has(chunk.index), false, `duplicate block index ${chunk.index}`)
+      open.set(chunk.index, chunk.blockType)
+    } else if (chunk.type === 'text-delta' || chunk.type === 'reasoning-delta') {
+      const expected = chunk.type === 'text-delta' ? 'text' : 'reasoning'
+      assert.equal(open.get(chunk.index), expected, `${chunk.type} requires an open ${expected} block`)
+    } else if (chunk.type === 'tool-call-delta') {
+      assert.equal(open.get(chunk.index), 'tool-call', 'tool delta requires an open tool block')
+    } else if (chunk.type === 'block-end') {
+      assert.equal(open.get(chunk.index), chunk.block.type, `block ${chunk.index} closed with the wrong type`)
+      open.delete(chunk.index)
+    } else if (chunk.type === 'usage') {
+      assert.equal(usageSeen, false, 'usage emitted twice')
+      usageSeen = true
+    } else if (chunk.type === 'finish') {
+      assert.equal(open.size, 0, 'finish emitted with open blocks')
+      finished = true
+    }
+  }
+  assert.equal(finished, true, 'stream did not finish')
+}
+
+async function collectMockedStream(response, options, adapter = adapterForStream()) {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => response
+  try {
+    return { adapter, chunks: await Array.fromAsync(adapter.stream(options)) }
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+}
 
 test('repairs missing pwsh description without changing other tools', () => {
   assert.equal(normalizeToolArguments('pwsh', '{"command":"Get-Date"}'), '{"command":"Get-Date","description":"Run PowerShell command"}')
   assert.equal(normalizeToolArguments('pwsh', '{"command":"Get-Date","description":"Read the date"}'), '{"command":"Get-Date","description":"Read the date"}')
-  assert.equal(normalizeToolArguments('write', '{"file_path":"out.md","content":"text","justification":"write the file"}'), '{"file_path":"out.md","content":"text"}')
-  assert.equal(normalizeToolArguments('write', '{"file_path":"out.md","content":"text","sandbox_permissions":"danger-full-access","justification":"write outside workspace"}'), '{"file_path":"out.md","content":"text","sandbox_permissions":"danger-full-access","justification":"write outside workspace"}')
   assert.equal(normalizeToolArguments('read', '{"path":"README.md"}'), '{"path":"README.md"}')
-  assert.equal(normalizeToolArguments('todo_write', '{"todos":[null,{"content":"Test","status":"pending"},null]}'), '{"todos":[{"content":"Test","status":"pending"}]}')
+})
+
+test('removes orphaned escalation justification for every tool', () => {
+  assert.equal(
+    normalizeToolArguments('write', '{"file_path":"note.txt","content":"ok","justification":"write it"}'),
+    '{"file_path":"note.txt","content":"ok"}',
+  )
+  assert.deepEqual(
+    normalizeToolArguments('custom_tool', {
+      value: 1,
+      sandbox_permissions: 'danger-full-access',
+      justification: 'Access the explicitly requested external target.',
+    }),
+    {
+      value: 1,
+      sandbox_permissions: 'danger-full-access',
+      justification: 'Access the explicitly requested external target.',
+    },
+  )
+})
+
+test('repairs arbitrary tool arguments from their JSON Schema', () => {
+  const schema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      items: {
+        type: 'array',
+        items: { type: 'object', additionalProperties: false, properties: { value: { type: 'string' } } },
+      },
+      mode: { type: 'string' },
+    },
+  }
+  assert.equal(
+    normalizeToolArguments('any_batch_tool', '{"items":[null,{"value":"ok","invented":true},7],"mode":"safe","unknown":"drop"}', schema),
+    '{"items":[{"value":"ok"}],"mode":"safe"}',
+  )
+})
+
+test('fills required description fields recursively from any tool schema', () => {
+  const schema = {
+    type: 'object',
+    required: ['code', 'description', 'meta'],
+    properties: {
+      code: { type: 'string' },
+      description: { type: 'string' },
+      meta: {
+        type: 'object',
+        required: ['name', 'description'],
+        properties: {
+          name: { type: 'string' },
+          description: { type: 'string' },
+        },
+      },
+    },
+  }
+  assert.deepEqual(
+    normalizeToolArguments('run_code', { code: 'return 1', meta: { name: 'check' } }, schema),
+    {
+      code: 'return 1',
+      description: 'Execute the requested run code operation',
+      meta: { name: 'check', description: 'Execute the requested run code operation' },
+    },
+  )
+})
+
+test('preserves undeclared fields unless JSON Schema explicitly forbids them', () => {
+  const openSchema = {
+    type: 'object',
+    properties: { known: { type: 'string' } },
+  }
+  assert.equal(
+    normalizeToolArguments('open_tool', '{"known":"yes","extension":{"value":1}}', openSchema),
+    '{"known":"yes","extension":{"value":1}}',
+  )
 })
 
 test('keeps image and PDF turns on the native Gemini route even when tools are present', () => {
@@ -17,6 +149,16 @@ test('keeps image and PDF turns on the native Gemini route even when tools are p
   assert.equal(shouldUseOpenAICompatibility({ messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }], tools }), true)
   assert.equal(shouldUseOpenAICompatibility({ messages: [{ role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'image-1' } }] }], tools }), false)
   assert.equal(shouldUseOpenAICompatibility({ messages: [{ role: 'user', content: [{ type: 'text', text: '[[dsh-gemini-file:C:\\tmp\\report.pdf]]' }] }], tools }), false)
+})
+
+test('keeps OpenAI compatibility after convergence removes tools from a tool-call turn', () => {
+  assert.equal(shouldUseOpenAICompatibility({
+    messages: [
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'call_1', name: 'glob', arguments: '{}' }] },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'call_1', content: [{ type: 'text', text: 'No files found' }], isError: false }] },
+    ],
+    tools: [],
+  }), true)
 })
 
 test('model discovery falls back without a credential and still declares vision and reasoning', async () => {
@@ -96,8 +238,173 @@ test('builds native Google Search for a plain prompt', async () => {
     messages: [{ role: 'user', content: [{ type: 'text', text: 'search this' }] }],
   }, { googleSearch: true, pdfCache: { get: async () => { throw new Error('not expected') } } })
   assert.deepEqual(request.systemInstruction.parts, [{ text: 'be concise' }])
-  assert.equal(request.tools[0].googleSearch !== undefined, true)
-  assert.equal(request.tools[0].googleSearch !== undefined, true)
+  assert.deepEqual(request.tools, [{ googleSearch: {} }])
+})
+
+test('removes DeepSeek web tools and stops repeated Gemini native searches', () => {
+  const tools = [
+    { name: 'web_search', description: 'Search', parameters: { type: 'object' } },
+    { name: 'web_fetch', description: 'Fetch', parameters: { type: 'object' } },
+    { name: 'gemini_web_search', description: 'Gemini Search', parameters: { type: 'object' } },
+    { name: 'read', description: 'Read', parameters: { type: 'object' } },
+  ]
+  const messages = [
+    { role: 'user', content: [{ type: 'text', text: 'Find GitHub owner/repo' }] },
+    ...Array.from({ length: 4 }, (_, index) => ({
+      role: 'assistant',
+      content: [{ type: 'tool-call', id: `search-${index}`, name: 'gemini_web_search', arguments: JSON.stringify({ query: `owner repo ${index}` }) }],
+    })),
+  ]
+  const prepared = prepareSearchConvergence({ system: 'base', messages, tools }, 4)
+  assert.equal(prepared.tools.some((tool) => tool.name === 'web_search'), false)
+  assert.equal(prepared.tools.some((tool) => tool.name === 'web_fetch'), false)
+  assert.equal(prepared.tools.some((tool) => tool.name === 'gemini_web_search'), false)
+  assert.match(prepared.system, /budget .* exhausted/i)
+  assert.match(prepared.system, /GitHub owner\/repository/)
+})
+
+test('keeps first-pass Gemini native search and removes legacy web tools', () => {
+  const prepared = prepareSearchConvergence({
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'Find an exact package' }] }],
+    tools: [
+      { name: 'web_search', parameters: { type: 'object' } },
+      { name: 'web_fetch', parameters: { type: 'object' } },
+      { name: 'gemini_web_search', parameters: { type: 'object' } },
+    ],
+  })
+  assert.equal(prepared.tools.some((tool) => tool.name === 'web_search'), false)
+  assert.equal(prepared.tools.some((tool) => tool.name === 'web_fetch'), false)
+  assert.equal(prepared.tools.some((tool) => tool.name === 'gemini_web_search'), true)
+  assert.match(prepared.system, /Gemini native Google Search and URL Context/)
+  assert.match(prepared.system, /Never replace an unverified exact target/)
+  assert.match(prepared.system, /quoted-name discovery lookup/)
+  assert.match(prepared.system, /primary page establishes the final fact/)
+  assert.match(prepared.system, /non-network local dsh tools for deterministic computation/)
+  assert.match(prepared.system, /workspace and file inspection, transformations, and result verification/)
+  assert.match(prepared.system, /Do not use shell commands, package-manager commands, scripts, or local browser tools to access public/)
+  assert.match(prepared.system, /Treat a successful non-network tool result as authoritative/)
+  assert.match(prepared.system, /Never rerun a semantically equivalent local operation/)
+  assert.match(prepared.system, /two independent local discovery attempts both return empty/)
+})
+
+test('temporarily suppresses only an exactly repeated local tool operation', () => {
+  const baseTools = [
+    { name: 'gemini_web_search', parameters: { type: 'object' } },
+    { name: 'read', parameters: { type: 'object' } },
+    { name: 'pwsh', parameters: { type: 'object' } },
+  ]
+  const duplicate = prepareSearchConvergence({
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'inspect once' }] },
+      { role: 'assistant', content: [{ type: 'tool-call', name: 'read', arguments: '{"path":"README.md","offset":0}' }] },
+      { role: 'tool', content: [{ type: 'text', text: 'contents' }] },
+      { role: 'assistant', content: [{ type: 'tool-call', name: 'read', arguments: '{"offset":0,"path":"README.md"}' }] },
+    ],
+    tools: baseTools,
+  })
+  assert.equal(duplicate.tools.some((tool) => tool.name === 'read'), false)
+  assert.equal(duplicate.tools.some((tool) => tool.name === 'pwsh'), true)
+  assert.match(duplicate.system, /exactly duplicates the preceding call/)
+
+  const progressed = prepareSearchConvergence({
+    messages: [
+      ...duplicate.messages,
+      { role: 'assistant', content: [{ type: 'tool-call', name: 'pwsh', arguments: '{"command":"Write-Output ok"}' }] },
+    ],
+    tools: baseTools,
+  })
+  assert.equal(progressed.tools.some((tool) => tool.name === 'read'), true)
+})
+
+test('forces a user clarification after two distinct empty local discovery results', () => {
+  const prepared = prepareSearchConvergence({
+    system: 'base',
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'Check this plugin' }] },
+      { role: 'assistant', content: [
+        { type: 'tool-call', id: 'call_1', name: 'glob', arguments: '{"pattern":"*.js"}' },
+        { type: 'tool-call', id: 'call_2', name: 'glob', arguments: '{"pattern":"package.json"}' },
+      ] },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'call_1', content: [{ type: 'text', text: 'No files found' }], isError: false }] },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'call_2', content: [{ type: 'text', text: '(no output)' }], isError: false }] },
+    ],
+    tools: [
+      { name: 'glob', parameters: { type: 'object' } },
+      { name: 'pwsh', parameters: { type: 'object' } },
+      { name: 'gemini_web_search', parameters: { type: 'object' } },
+    ],
+  }, 4)
+  assert.deepEqual(prepared.tools, [])
+  assert.match(prepared.system, /2 distinct local discovery operations/)
+  assert.match(prepared.system, /Ask the user for the missing workspace/)
+})
+
+test('does not force convergence after one empty result or any substantive result', () => {
+  const oneEmpty = prepareSearchConvergence({
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'Check this plugin' }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'call_1', name: 'glob', arguments: '{"pattern":"*.js"}' }] },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'call_1', content: [{ type: 'text', text: 'No files found' }], isError: false }] },
+    ],
+    tools: [{ name: 'glob' }, { name: 'gemini_web_search' }],
+  }, 4)
+  assert.equal(oneEmpty.tools.some((tool) => tool.name === 'glob'), true)
+
+  const withEvidence = prepareSearchConvergence({
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'Check this plugin' }] },
+      { role: 'assistant', content: [
+        { type: 'tool-call', id: 'call_1', name: 'glob', arguments: '{"pattern":"*.js"}' },
+        { type: 'tool-call', id: 'call_2', name: 'glob', arguments: '{"pattern":"package.json"}' },
+        { type: 'tool-call', id: 'call_3', name: 'read', arguments: '{"path":"package.json"}' },
+      ] },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'call_1', content: [{ type: 'text', text: 'No files found' }], isError: false }] },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'call_2', content: [{ type: 'text', text: 'No files found' }], isError: false }] },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'call_3', content: [{ type: 'text', text: '{"version":"0.1.4"}' }], isError: false }] },
+    ],
+    tools: [{ name: 'glob' }, { name: 'read' }, { name: 'gemini_web_search' }],
+  }, 4)
+  assert.equal(withEvidence.tools.length, 3)
+})
+
+test('registers Gemini native search with provider-valid JSON Schema', () => {
+  const registered = []
+  apply({
+    llm: { registerAdapter: () => () => {} },
+    tools: { register: (tool) => { registered.push(tool); return () => {} } },
+    effect: () => () => {},
+    get: () => undefined,
+  })
+  const search = registered.find((tool) => tool.name === 'gemini_web_search')
+  assert.deepEqual(search.parameters, {
+    type: 'object',
+    additionalProperties: false,
+    required: ['query'],
+    properties: {
+      query: { type: 'string', description: 'One precise web lookup request. Include complete URLs and exact identifiers when available.' },
+    },
+  })
+})
+
+test('Gemini native lookup enables Google Search and URL Context together', async () => {
+  const originalFetch = globalThis.fetch
+  let captured
+  globalThis.fetch = async (url, init) => {
+    captured = { url, body: JSON.parse(init.body) }
+    return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: 'grounded result' }] } }] }), { status: 200, headers: { 'content-type': 'application/json' } })
+  }
+  try {
+    const result = await runNativeWebLookup({
+      baseURL: 'http://127.0.0.1:8080',
+      models: ['gemini-test'],
+      resolveApiKey: async () => 'test-key',
+    }, 'https://github.com/example/provider', undefined)
+    assert.deepEqual(captured.body.tools, [{ googleSearch: {} }, { urlContext: {} }])
+    assert.match(captured.url, /gemini-test:generateContent$/)
+    assert.equal(result.text, 'grounded result')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
 })
 
 test('maps dsh reasoning effort to Gemini thinking level', async () => {
@@ -136,6 +443,119 @@ test('implements the dsh prepared-call adapter contract', async () => {
   assert.deepEqual(await Array.fromAsync(prepared.stream({})), [
     { type: 'finish', reason: { kind: 'stop' } },
   ])
+})
+
+test('emits a strict native text and reasoning stream and consumes the final SSE line', async () => {
+  const payload = JSON.stringify({
+    candidates: [{
+      content: { parts: [{ thought: true, text: 'reasoning' }, { text: 'answer' }] },
+      finishReason: 'STOP',
+    }],
+    usageMetadata: { promptTokenCount: 3, candidatesTokenCount: 2, thoughtsTokenCount: 1 },
+  })
+  const response = streamResponse(['data: ', payload.slice(0, 25), payload.slice(25)])
+  const { chunks } = await collectMockedStream(response, {
+    model: 'gemini-test',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+  })
+
+  validateStrictStream(chunks)
+  assert.deepEqual(chunks.filter((chunk) => chunk.type === 'block-start').map((chunk) => [chunk.index, chunk.blockType]), [[1, 'reasoning'], [0, 'text']])
+  assert.equal(chunks.find((chunk) => chunk.type === 'block-end' && chunk.index === 1).block.text, 'reasoning')
+  assert.equal(chunks.find((chunk) => chunk.type === 'block-end' && chunk.index === 0).block.text, 'answer')
+  assert.deepEqual(chunks.at(-1), { type: 'finish', reason: { kind: 'stop' } })
+})
+
+test('emits strict OpenAI text, reasoning, and fragmented tool-call blocks with unique indexes', async () => {
+  const events = [
+    { choices: [{ delta: { reasoning_content: 'think', content: 'checking' } }] },
+    { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_1', function: { name: 'read', arguments: '{"path":"' } }] } }] },
+    { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: 'README.md"}' } }] } }] },
+    { choices: [{ delta: {}, finish_reason: 'tool_calls' }], usage: { prompt_tokens: 10, completion_tokens: 4 } },
+  ]
+  const sse = events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('') + 'data: [DONE]'
+  const { chunks } = await collectMockedStream(streamResponse([sse.slice(0, 17), sse.slice(17, 83), sse.slice(83)]), {
+    model: 'gemini-test',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'read it' }] }],
+    tools: [{ name: 'read', description: 'read a file', parameters: { type: 'object' } }],
+  })
+
+  validateStrictStream(chunks)
+  const starts = chunks.filter((chunk) => chunk.type === 'block-start')
+  assert.deepEqual(new Set(starts.map((chunk) => chunk.index)).size, starts.length)
+  const tool = chunks.find((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call')
+  assert.deepEqual(tool.block, { type: 'tool-call', id: 'call_1', name: 'read', arguments: '{"path":"README.md"}' })
+  assert.deepEqual(chunks.at(-1), { type: 'finish', reason: { kind: 'tool-calls' } })
+})
+
+test('separates complete tool calls when an older proxy omits stream indexes', async () => {
+  const events = [
+    { choices: [{ delta: { tool_calls: [{ id: 'call_todo', function: { name: 'todo_write', arguments: '{"todos":[]}' } }] } }] },
+    { choices: [{ delta: { tool_calls: [{ id: 'call_read', function: { name: 'read', arguments: '{"file_path":"README.md"}' } }] } }] },
+    { choices: [{ delta: {}, finish_reason: 'tool_calls' }] },
+  ]
+  const { chunks } = await collectMockedStream(streamResponse([events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('')]), {
+    model: 'gemini-test',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'use two tools' }] }],
+    tools: [{ name: 'read', parameters: { type: 'object' } }],
+  })
+
+  validateStrictStream(chunks)
+  const calls = chunks.filter((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call').map((chunk) => chunk.block)
+  assert.deepEqual(calls, [
+    { type: 'tool-call', id: 'call_todo', name: 'todo_write', arguments: '{"todos":[]}' },
+    { type: 'tool-call', id: 'call_read', name: 'read', arguments: '{"file_path":"README.md"}' },
+  ])
+})
+
+test('emits at most one Gemini native search call per model response', async () => {
+  const event = {
+    choices: [{ delta: { tool_calls: [
+      { index: 0, id: 'search_1', function: { name: 'gemini_web_search', arguments: '{"query":"first"}' } },
+      { index: 1, id: 'search_2', function: { name: 'gemini_web_search', arguments: '{"query":"near duplicate"}' } },
+    ] }, finish_reason: 'tool_calls' }],
+  }
+  const { chunks } = await collectMockedStream(streamResponse([`data: ${JSON.stringify(event)}\n\ndata: [DONE]\n\n`]), {
+    model: 'gemini-test',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'verify current news' }] }],
+    tools: [{ name: 'gemini_web_search', parameters: { type: 'object' } }],
+  })
+
+  validateStrictStream(chunks)
+  const calls = chunks.filter((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call').map((chunk) => chunk.block)
+  assert.deepEqual(calls, [
+    { type: 'tool-call', id: 'search_1', name: 'gemini_web_search', arguments: '{"query":"first"}' },
+  ])
+})
+
+test('preserves native function-call thought signatures without swallowing conversion errors', async () => {
+  const payload = JSON.stringify({
+    candidates: [{
+      content: { parts: [{ functionCall: { id: 'native_1', name: 'read', args: { path: 'README.md' }, thoughtSignature: 'sig-native' } }] },
+      finishReason: 'STOP',
+    }],
+  })
+  const adapter = adapterForStream()
+  const { chunks } = await collectMockedStream(streamResponse([`data: ${payload}\n\n`]), {
+    model: 'gemini-test',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'read it' }] }],
+  }, adapter)
+
+  validateStrictStream(chunks)
+  assert.equal(adapter.callSignatures.get('native_1'), 'sig-native')
+  assert.deepEqual(chunks.at(-1), { type: 'finish', reason: { kind: 'tool-calls' } })
+})
+
+test('reports a completed empty provider response as an explicit error finish', async () => {
+  const payload = JSON.stringify({ candidates: [{ content: { parts: [] }, finishReason: 'STOP' }] })
+  const { chunks } = await collectMockedStream(streamResponse([`data: ${payload}\n\n`]), {
+    model: 'gemini-test',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+  })
+
+  validateStrictStream(chunks)
+  assert.equal(chunks.at(-1).reason.kind, 'error')
+  assert.equal(chunks.at(-1).reason.failure.code, 'EMPTY_RESPONSE')
 })
 
 test('forwards reasoning effort through OpenAI tool-call requests', async () => {

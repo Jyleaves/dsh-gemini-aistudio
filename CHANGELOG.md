@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-08-25
+
+### Changed
+
+- Emit explicit block start and end events for text, reasoning, and tool calls
+  on both native Gemini and OpenAI-compatible streaming routes.
+- Reserve independent stream indexes for text, reasoning, and tool-call blocks
+  so dsh can assemble mixed responses deterministically.
+- Replace dsh's DeepSeek-backed `web_search` and `web_fetch` for Gemini sessions
+  with `gemini_web_search`, backed exclusively by Gemini native Google Search
+  and URL Context through Asteria.
+- Cap Gemini native web lookup calls at four per user turn by default and guide
+  exact URLs, repositories, package coordinates, DOI/CVE identifiers, and
+  quoted errors into one precise lookup.
+- Forbid substituting similarly named projects for an unverified exact target;
+  ask for a unique owner, identifier, or URL instead of guessing.
+- Guide exact lookup through a domain-independent identity-resolution chain:
+  quoted-name discovery, canonical identifier or URL, then primary-page
+  verification.
+
+### Fixed
+
+- Prevent strict dsh stream consumers from ending a Gemini turn immediately
+  when the provider returned a valid response.
+- Preserve fragmented tool arguments, native thought signatures, and the final
+  SSE event when a provider closes the stream without a trailing newline.
+- Surface completed-but-empty provider responses as an explicit error instead
+  of silently ending the conversation.
+- Normalize Gemini and OpenAI finish reasons after all open blocks have closed.
+- Register the native web-search tool with a provider-valid object JSON Schema,
+  preventing every Gemini request from failing before the tool is called.
+- Keep consecutive Gemini tool calls separate when an older Asteria stream
+  omits OpenAI tool-call indexes, instead of concatenating their JSON inputs.
+- Repair malformed arguments for arbitrary dsh tools from their declared JSON
+  Schema, including invalid object-array entries and undeclared fields.
+- Preserve extension fields for open JSON Schemas; remove unknown properties
+  only when the tool explicitly declares `additionalProperties: false`.
+- Fill omitted required string `description` fields at any declared object
+  level, covering `pwsh`, `run_code`, and workflow metadata without task-
+  specific argument patches.
+- Remove orphaned escalation `justification` fields for every tool when no
+  `sandbox_permissions` request accompanies them, while preserving valid
+  approval requests unchanged.
+- Limit native web lookup to one call per model response so parallel near-
+  duplicate searches cannot bypass the per-turn budget.
+- Clarify that a no-browsing request disables only native web lookup while
+  retaining non-network local tools for computation, runtime state, workspace
+  inspection, transformations, and verification within the user's scope.
+- Prevent shell, package-manager, script, or local-browser network requests
+  from bypassing Gemini native web lookup. Treat successful local-tool output
+  as reusable evidence and stop semantically equivalent confirmation loops.
+- Temporarily suppress an exactly repeated consecutive local-tool operation
+  until another tool makes progress, without blocking legitimate later reuse.
+- Stop local discovery after two independent empty results and request the
+  missing workspace, path, or identifier instead of cycling through tools.
+
+### Tests
+
+- Add strict stream-invariant coverage for native text/reasoning, OpenAI text,
+  reasoning and fragmented tool calls, thought signatures, and empty responses.
+- Add a regression assertion for the exact native-search input schema exposed
+  to dsh and Asteria.
+- Cover index-less consecutive tool calls from older proxy releases.
+- Cover parallel native-search suppression in a single model response.
+- Cover generic recursive `description` repair, invalid object-array cleanup,
+  open-schema extension preservation, and orphaned escalation fields.
+- Cover deterministic clarification after distinct empty local discoveries,
+  while preserving tool access after one empty or any substantive result.
+
 ## [0.1.3] - 2026-08-25
 
 ### Added
@@ -94,7 +163,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Repair missing PowerShell tool descriptions and remove stray write/edit
   justifications before forwarding tool schemas to Gemini.
 
-[Unreleased]: https://github.com/Jyleaves/dsh-gemini-aistudio/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/Jyleaves/dsh-gemini-aistudio/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/Jyleaves/dsh-gemini-aistudio/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/Jyleaves/dsh-gemini-aistudio/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/Jyleaves/dsh-gemini-aistudio/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/Jyleaves/dsh-gemini-aistudio/compare/v0.1.0...v0.1.1
