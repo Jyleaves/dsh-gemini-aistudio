@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-08-25
+
+### Changed
+
+- Add schema- and runtime-driven recovery guidance for missing required tool
+  fields, stale edit anchors, invalid single-glob filters, over-broad searches,
+  non-widening sandbox requests, and empty native web-search queries.
+- Keep each provider tool call as an independent JSON object and explicitly
+  forbid leaking provider control markers into another tool's arguments.
+
+### Fixed
+
+- Remove `sandbox_permissions` and `justification` when Gemini requests the
+  current or a narrower sandbox mode, while preserving genuinely wider
+  escalation requests.
+- Convert comma-separated `grep.include` values to one brace-alternation glob
+  when the active dsh tool Schema declares a single glob.
+- Reject blank `gemini_web_search` input before network access so its output can
+  never contain a non-lossless `undefined` query value.
+- Reclassify echoed internal tool-completion notifications as reasoning instead
+  of exposing them as normal assistant answer text.
+- Stop repeated equivalent operational failures for only the affected tool,
+  leaving unrelated tools available so the agent can recover safely.
+
+### Tests
+
+- Add streaming-adapter regression coverage for runtime sandbox repair,
+  single-glob normalization, fragmented internal-notification filtering, and
+  ordinary text preservation; the complete suite now passes 63 tests.
+- Verify a fresh dsh Web session with Gemini Flash Lite Latest at High reasoning
+  across `todo_write`, `write`, `grep`, and `read`: all three tasks completed in
+  seven model steps with no tool error and reasoning remained in the Think UI.
+
 ## [0.1.6] - 2026-08-25
 
 ### Fixed

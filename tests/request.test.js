@@ -88,6 +88,63 @@ test('removes orphaned escalation justification for every tool', () => {
   )
 })
 
+test('removes only non-widening sandbox escalation requests', () => {
+  const args = {
+    file_path: 'note.txt',
+    content: 'ok',
+    sandbox_permissions: 'workspace-write',
+    justification: 'Write outside the read-only standing mode.',
+  }
+  assert.deepEqual(
+    normalizeToolArguments('write', args, undefined, { currentSandboxMode: 'workspace-write' }),
+    { file_path: 'note.txt', content: 'ok' },
+  )
+  assert.deepEqual(
+    normalizeToolArguments('write', args, undefined, { currentSandboxMode: 'read-only' }),
+    args,
+  )
+  assert.deepEqual(
+    normalizeToolArguments('write', {
+      ...args,
+      sandbox_permissions: 'danger-full-access',
+    }, undefined, { currentSandboxMode: 'workspace-write' }),
+    { ...args, sandbox_permissions: 'danger-full-access' },
+  )
+})
+
+test('converts comma-separated include filters into one brace-alternation glob', () => {
+  const schema = {
+    type: 'object',
+    properties: {
+      pattern: { type: 'string' },
+      include: { type: 'string', description: 'One glob filter. Not a list.' },
+    },
+  }
+  assert.equal(
+    normalizeToolArguments('grep', '{"pattern":"TODO","include":"*.js, *.ts"}', schema),
+    '{"pattern":"TODO","include":"{*.js,*.ts}"}',
+  )
+  assert.equal(
+    normalizeToolArguments('grep', '{"pattern":"TODO","include":"*.{js,ts}"}', schema),
+    '{"pattern":"TODO","include":"*.{js,ts}"}',
+  )
+})
+
+test('does not invent missing required file content', () => {
+  const schema = {
+    type: 'object',
+    required: ['file_path', 'content'],
+    properties: {
+      file_path: { type: 'string' },
+      content: { type: 'string' },
+    },
+  }
+  assert.equal(
+    normalizeToolArguments('write', '{"file_path":"note.txt"}', schema),
+    '{"file_path":"note.txt"}',
+  )
+})
+
 test('repairs arbitrary tool arguments from their JSON Schema', () => {
   const schema = {
     type: 'object',
@@ -556,8 +613,71 @@ test('suppresses only a repeatedly invalid tool while preserving other tools', (
     ],
   })
   assert.deepEqual(prepared.tools.map((tool) => tool.name), ['read', 'todo_write'])
-  assert.match(prepared.system, /repeatedly failed argument validation/)
+  assert.match(prepared.system, /repeatedly produced equivalent failures/)
   assert.match(prepared.system, /subagent/)
+})
+
+test('provides actionable recovery for common dsh tool failures without guessing data', () => {
+  const cases = [
+    {
+      tool: 'write',
+      error: 'Error: invalid arguments: missing required property "content"',
+      expected: /complete intended file content/,
+    },
+    {
+      tool: 'write',
+      error: 'Error: sandbox escalation to "workspace-write" is not strictly wider than this call\'s current "workspace-write" mode',
+      expected: /Omit sandbox_permissions and justification/,
+    },
+    {
+      tool: 'edit',
+      error: 'Error: old_string was not found in "D:\\Document\\feedback-log.md"',
+      expected: /Read the current target file/,
+    },
+    {
+      tool: 'grep',
+      error: 'Error: include must be one glob, not a comma-separated list (use {a,b} alternation instead)',
+      expected: /brace-alternation glob/,
+    },
+    {
+      tool: 'grep',
+      error: 'Error: grep produced more raw output than the subprocess seam retained within the 20000000-byte cap; narrow pattern, path, or include and retry',
+      expected: /Narrow the path/,
+    },
+    {
+      tool: 'gemini_web_search',
+      error: 'Error: tool "gemini_web_search" returned invalid output: value is not lossless JSON',
+      expected: /non-empty, precise query/,
+    },
+  ]
+  for (const [index, entry] of cases.entries()) {
+    const prepared = prepareSearchConvergence({
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'continue the task' }] },
+        { role: 'assistant', content: [{ type: 'tool-call', id: `call-${index}`, name: entry.tool, arguments: '{}' }] },
+        { role: 'user', content: [{ type: 'tool-result', toolCallId: `call-${index}`, content: [{ type: 'text', text: entry.error }], isError: true }] },
+      ],
+      tools: [{ name: entry.tool, parameters: { type: 'object' } }, { name: 'read', parameters: { type: 'object' } }],
+    })
+    assert.match(prepared.system, entry.expected)
+    assert.equal(prepared.tools.some((tool) => tool.name === entry.tool), true)
+  }
+})
+
+test('stops repeated non-widening escalation failures while preserving read access', () => {
+  const error = 'Error: sandbox escalation to "workspace-write" is not strictly wider than this call\'s current "workspace-write" mode'
+  const prepared = prepareSearchConvergence({
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'write the report' }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'write-1', name: 'write', arguments: '{}' }] },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'write-1', content: [{ type: 'text', text: error }], isError: true }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'write-2', name: 'write', arguments: '{}' }] },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'write-2', content: [{ type: 'text', text: error }], isError: true }] },
+    ],
+    tools: [{ name: 'write' }, { name: 'read' }],
+  })
+  assert.deepEqual(prepared.tools.map((tool) => tool.name), ['read'])
+  assert.match(prepared.system, /repeatedly produced equivalent failures/)
 })
 
 test('keeps non-search tools available when native search reaches its budget', () => {
@@ -700,6 +820,24 @@ test('Gemini native lookup enables Google Search and URL Context together', asyn
   }
 })
 
+test('rejects an empty Gemini native lookup before producing non-lossless output', async () => {
+  const originalFetch = globalThis.fetch
+  let called = false
+  globalThis.fetch = async () => {
+    called = true
+    throw new Error('not expected')
+  }
+  try {
+    await assert.rejects(
+      runNativeWebLookup({ resolveApiKey: async () => 'test-key' }, undefined, undefined),
+      (error) => error?.code === 'INVALID_ARGS' && /non-empty query/.test(error.message),
+    )
+    assert.equal(called, false)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
 test('maps dsh reasoning effort to Gemini thinking level', async () => {
   const request = await buildGeminiRequest({
     reasoningEffort: 'medium',
@@ -779,6 +917,70 @@ test('emits strict OpenAI text, reasoning, and fragmented tool-call blocks with 
   const tool = chunks.find((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call')
   assert.deepEqual(tool.block, { type: 'tool-call', id: 'call_1', name: 'read', arguments: '{"path":"README.md"}' })
   assert.deepEqual(chunks.at(-1), { type: 'finish', reason: { kind: 'tool-calls' } })
+})
+
+test('applies runtime sandbox and glob repairs through the streaming adapter', async () => {
+  const events = [
+    { choices: [{ delta: { tool_calls: [
+      { index: 0, id: 'call_write', function: { name: 'write', arguments: '{"file_path":"note.txt","content":"ok","sandbox_permissions":"workspace-write","justification":"write"}' } },
+      { index: 1, id: 'call_grep', function: { name: 'grep', arguments: '{"pattern":"TODO","include":"*.js, *.ts"}' } },
+    ] }, finish_reason: 'tool_calls' }] },
+  ]
+  const { chunks } = await collectMockedStream(streamResponse([`data: ${JSON.stringify(events[0])}\n\ndata: [DONE]\n\n`]), {
+    model: 'gemini-test',
+    system: 'Current DSH file policy: workspace-write',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'write and search' }] }],
+    tools: [
+      { name: 'write', parameters: { type: 'object' } },
+      { name: 'grep', parameters: { type: 'object', properties: { include: { type: 'string', description: 'One glob filter. Not a list.' } } } },
+    ],
+  })
+
+  const calls = chunks
+    .filter((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call')
+    .map((chunk) => chunk.block)
+  assert.deepEqual(calls, [
+    { type: 'tool-call', id: 'call_write', name: 'write', arguments: '{"file_path":"note.txt","content":"ok"}' },
+    { type: 'tool-call', id: 'call_grep', name: 'grep', arguments: '{"pattern":"TODO","include":"{*.js,*.ts}"}' },
+  ])
+})
+
+test('reclassifies fragmented internal runtime echoes as reasoning instead of answer text', async () => {
+  const events = [
+    { choices: [{ delta: { content: 'A' } }] },
+    { choices: [{ delta: { content: ' previously requested tool execution completed.\nTool: write\nResult:\n(no output)' } }] },
+    { choices: [{ delta: {}, finish_reason: 'stop' }] },
+  ]
+  const { chunks } = await collectMockedStream(streamResponse([
+    events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('') + 'data: [DONE]\n\n',
+  ]), {
+    model: 'gemini-test',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'finish the task' }] }],
+    tools: [{ name: 'write', parameters: { type: 'object' } }],
+  })
+
+  validateStrictStream(chunks)
+  assert.equal(chunks.some((chunk) => chunk.type === 'text-delta'), false)
+  const reasoning = chunks.find((chunk) => chunk.type === 'block-end' && chunk.block.type === 'reasoning')
+  assert.match(reasoning.block.text, /^A previously requested tool execution completed\./)
+})
+
+test('does not delay or reclassify ordinary answer text after its prefix diverges', async () => {
+  const events = [
+    { choices: [{ delta: { content: 'A useful' } }] },
+    { choices: [{ delta: { content: ' answer' }, finish_reason: 'stop' }] },
+  ]
+  const { chunks } = await collectMockedStream(streamResponse([
+    events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''),
+  ]), {
+    model: 'gemini-test',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'answer normally' }] }],
+    tools: [{ name: 'read', parameters: { type: 'object' } }],
+  })
+
+  validateStrictStream(chunks)
+  const text = chunks.find((chunk) => chunk.type === 'block-end' && chunk.block.type === 'text')
+  assert.equal(text.block.text, 'A useful answer')
 })
 
 test('separates complete tool calls when an older proxy omits stream indexes', async () => {
