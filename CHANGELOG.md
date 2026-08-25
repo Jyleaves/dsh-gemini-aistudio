@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-08-25
+
+### Fixed
+
+- Normalize malformed Gemini arguments recursively for every dsh tool: omit
+  optional non-nullable `null` values, preserve schema-approved nulls, coerce
+  unambiguous boolean/number/integer/string values, canonicalize enum casing,
+  and apply only deterministic schema defaults.
+- Preserve invalid required values when no safe schema fallback exists instead
+  of inventing user intent, while stopping repeated argument-validation loops
+  after two equivalent failures and keeping unrelated tools available.
+- Count only successful tool results as task-list progress, so failed task
+  writes do not become canonical and failed work cannot advance todo status.
+- Keep local tools available after Gemini native search reaches its per-turn
+  budget or converges on near-equivalent results; only the search tool is
+  removed.
+
+### Tests
+
+- Add regression coverage for nullable and non-nullable scalars, nested arrays,
+  enum/default repair, repeated validation failures, failed todo transitions,
+  and search-budget isolation.
+- Verify a real dsh web session with two parallel subagents plus `todo_write`,
+  `read`, `glob`, `pwsh`, and `list_agents`; all four tasks completed without an
+  `INVALID_ARGS` event.
+
 ## [0.1.5] - 2026-08-25
 
 ### Changed
@@ -195,7 +221,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Repair missing PowerShell tool descriptions and remove stray write/edit
   justifications before forwarding tool schemas to Gemini.
 
-[Unreleased]: https://github.com/Jyleaves/dsh-gemini-aistudio/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/Jyleaves/dsh-gemini-aistudio/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/Jyleaves/dsh-gemini-aistudio/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/Jyleaves/dsh-gemini-aistudio/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/Jyleaves/dsh-gemini-aistudio/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/Jyleaves/dsh-gemini-aistudio/compare/v0.1.2...v0.1.3

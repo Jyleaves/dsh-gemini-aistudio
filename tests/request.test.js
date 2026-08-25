@@ -106,6 +106,92 @@ test('repairs arbitrary tool arguments from their JSON Schema', () => {
   )
 })
 
+test('drops optional null scalars and safely coerces common Gemini scalar mismatches', () => {
+  const schema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      run_in_background: { type: 'boolean' },
+      timeout_ms: { type: 'integer' },
+      temperature: { type: 'number' },
+      status: { type: 'string', enum: ['pending', 'in_progress', 'completed'] },
+      label: { type: 'string' },
+    },
+  }
+  assert.equal(
+    normalizeToolArguments('subagent', '{"run_in_background":null,"timeout_ms":"30000","temperature":"0.25","status":"COMPLETED","label":7}', schema),
+    '{"timeout_ms":30000,"temperature":0.25,"status":"completed","label":"7"}',
+  )
+})
+
+test('preserves schema-approved nulls and fills deterministic required defaults', () => {
+  const schema = {
+    type: 'object',
+    required: ['mode', 'attempts'],
+    properties: {
+      exit_code: { oneOf: [{ type: 'integer' }, { type: 'null' }] },
+      mode: { type: 'string', enum: ['safe'] },
+      attempts: { type: 'integer', default: 1 },
+    },
+  }
+  assert.deepEqual(
+    normalizeToolArguments('workflow', { exit_code: null, mode: null, attempts: null }, schema),
+    { exit_code: null, mode: 'safe', attempts: 1 },
+  )
+})
+
+test('preserves enum-approved nulls and does not invent required scalar values', () => {
+  const schema = {
+    type: 'object',
+    required: ['decision'],
+    properties: {
+      optional_state: { enum: [null, 'ready'] },
+      decision: { type: 'boolean' },
+    },
+  }
+  assert.deepEqual(
+    normalizeToolArguments('approval', { optional_state: null, decision: null }, schema),
+    { optional_state: null, decision: null },
+  )
+})
+
+test('repairs nested arrays for boolean, integer, enum, and object item schemas', () => {
+  const schema = {
+    type: 'object',
+    properties: {
+      flags: { type: 'array', items: { type: 'boolean' } },
+      indexes: { type: ['array', 'null'], items: { type: 'integer' } },
+      statuses: { type: 'array', items: { type: 'string', enum: ['pending', 'completed'] } },
+      todos: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['content', 'status'],
+          properties: {
+            content: { type: 'string' },
+            status: { type: 'string', enum: ['pending', 'completed'] },
+          },
+        },
+      },
+    },
+  }
+  assert.deepEqual(
+    normalizeToolArguments('batch', {
+      flags: ['true', null, false],
+      indexes: ['1', 2, null],
+      statuses: ['PENDING', null, 'completed'],
+      todos: [null, { content: 'verify', status: 'COMPLETED', extra: true }, 7],
+    }, schema),
+    {
+      flags: [true, false],
+      indexes: [1, 2],
+      statuses: ['pending', 'completed'],
+      todos: [{ content: 'verify', status: 'completed' }],
+    },
+  )
+})
+
 test('fills required description fields recursively from any tool schema', () => {
   const schema = {
     type: 'object',
@@ -253,6 +339,36 @@ test('temporarily removes task-list tools until a non-task tool result makes pro
     ],
   })
   assert.deepEqual(afterRealProgress.tools.map((tool) => tool.name), ['todo_write', 'read'])
+})
+
+test('does not count failed tools as task progress or failed task writes as canonical state', () => {
+  const todo = {
+    name: 'todo_write',
+    description: 'Record and update a structured task list',
+    parameters: { type: 'object', properties: { todos: { type: 'array', items: { type: 'object' } } } },
+  }
+  const subagent = { name: 'subagent', parameters: { type: 'object' } }
+  const afterFailedWork = prepareAgentExecution({
+    tools: [todo, subagent],
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'build it' }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'todo-1', name: 'todo_write', arguments: '{"todos":[]}' }] },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'todo-1', content: [{ type: 'text', text: 'Updated todo list.' }], isError: false }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'sub-1', name: 'subagent', arguments: '{}' }] },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'sub-1', content: [{ type: 'text', text: 'Error: invalid arguments' }], isError: true }] },
+    ],
+  })
+  assert.deepEqual(afterFailedWork.tools.map((tool) => tool.name), ['subagent'])
+
+  const afterFailedTodo = prepareAgentExecution({
+    tools: [todo, subagent],
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'build it' }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'todo-1', name: 'todo_write', arguments: '{"todos":[null]}' }] },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'todo-1', content: [{ type: 'text', text: 'Error: invalid arguments' }], isError: true }] },
+    ],
+  })
+  assert.deepEqual(afterFailedTodo.tools.map((tool) => tool.name), ['todo_write', 'subagent'])
 })
 
 test('keeps OpenAI compatibility after convergence removes tools from a tool-call turn', () => {
@@ -410,7 +526,7 @@ test('stops near-equivalent successful web searches while preserving distinct re
     tools,
   })
   assert.equal(redundant.tools.some((tool) => tool.name === 'gemini_web_search'), false)
-  assert.equal(redundant.tools.length, 0)
+  assert.deepEqual(redundant.tools.map((tool) => tool.name), ['read'])
   assert.match(redundant.system, /near-equivalent queries/)
 
   const distinct = prepareSearchConvergence({
@@ -422,6 +538,46 @@ test('stops near-equivalent successful web searches while preserving distinct re
     tools,
   })
   assert.equal(distinct.tools.some((tool) => tool.name === 'gemini_web_search'), true)
+})
+
+test('suppresses only a repeatedly invalid tool while preserving other tools', () => {
+  const prepared = prepareSearchConvergence({
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'delegate two tasks' }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'sub-1', name: 'subagent', arguments: '{"prompt":"backend","run_in_background":null}' }] },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'sub-1', content: [{ type: 'text', text: 'Error: invalid arguments: "run_in_background" must be a boolean' }], isError: true }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'sub-2', name: 'subagent', arguments: '{"prompt":"frontend","run_in_background":null}' }] },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'sub-2', content: [{ type: 'text', text: 'Error: invalid arguments: "run_in_background" must be a boolean' }], isError: true }] },
+    ],
+    tools: [
+      { name: 'subagent', parameters: { type: 'object' } },
+      { name: 'read', parameters: { type: 'object' } },
+      { name: 'todo_write', parameters: { type: 'object' } },
+    ],
+  })
+  assert.deepEqual(prepared.tools.map((tool) => tool.name), ['read', 'todo_write'])
+  assert.match(prepared.system, /repeatedly failed argument validation/)
+  assert.match(prepared.system, /subagent/)
+})
+
+test('keeps non-search tools available when native search reaches its budget', () => {
+  const messages = [
+    { role: 'user', content: [{ type: 'text', text: 'research and inspect the local file' }] },
+    ...Array.from({ length: 4 }, (_, index) => ({
+      role: 'assistant',
+      content: [{ type: 'tool-call', id: `search-${index}`, name: 'gemini_web_search', arguments: JSON.stringify({ query: `query ${index}` }) }],
+    })),
+  ]
+  const prepared = prepareSearchConvergence({
+    messages,
+    tools: [
+      { name: 'gemini_web_search', parameters: { type: 'object' } },
+      { name: 'read', parameters: { type: 'object' } },
+      { name: 'pwsh', parameters: { type: 'object' } },
+    ],
+  }, 4)
+  assert.deepEqual(prepared.tools.map((tool) => tool.name), ['read', 'pwsh'])
+  assert.match(prepared.system, /continue with relevant non-network tools/)
 })
 
 test('temporarily suppresses only an exactly repeated local tool operation', () => {
