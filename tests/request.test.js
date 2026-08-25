@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { buildGeminiRequest, buildOpenAIRequest } from '../lib/request.js'
-import { GeminiAdapter, apply, normalizeToolArguments, prepareSearchConvergence, reasoningMetadata, runNativeWebLookup, shouldUseOpenAICompatibility } from '../lib/index.js'
+import { buildGeminiRequest, buildOpenAIRequest, sanitizeToolSchema } from '../lib/request.js'
+import { GeminiAdapter, apply, normalizeToolArguments, prepareAgentExecution, prepareSearchConvergence, reasoningMetadata, runNativeWebLookup, shouldUseOpenAICompatibility } from '../lib/index.js'
 
 function streamResponse(chunks) {
   const encoder = new TextEncoder()
@@ -151,6 +151,110 @@ test('keeps image and PDF turns on the native Gemini route even when tools are p
   assert.equal(shouldUseOpenAICompatibility({ messages: [{ role: 'user', content: [{ type: 'text', text: '[[dsh-gemini-file:C:\\tmp\\report.pdf]]' }] }], tools }), false)
 })
 
+test('repairs untyped third-party tool schemas before either proxy route', async () => {
+  const tool = {
+    name: 'dev_stage_call',
+    description: 'Call a staged tool',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: { type: 'string' },
+        args: { description: 'Optional JSON arguments' },
+      },
+      required: ['name'],
+    },
+  }
+  const options = { model: 'gemini-3.7-flash', messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }], tools: [tool] }
+
+  assert.deepEqual(sanitizeToolSchema(tool.parameters).properties.args, {
+    type: 'object',
+    description: 'Optional JSON arguments',
+    properties: {},
+  })
+  const native = await buildGeminiRequest(options, { googleSearch: false })
+  const openai = await buildOpenAIRequest(options, {})
+  assert.equal(native.tools[0].functionDeclarations[0].parameters.properties.args.type, 'object')
+  assert.equal(openai.tools[0].function.parameters.properties.args.type, 'object')
+})
+
+test('preserves reasoning as reasoning history instead of normal answer text', async () => {
+  const options = {
+    model: 'gemini-3.7-flash',
+    messages: [{ role: 'assistant', content: [{ type: 'reasoning', text: 'private analysis' }, { type: 'text', text: 'visible answer' }] }],
+  }
+  const native = await buildGeminiRequest(options, { googleSearch: false })
+  const openai = await buildOpenAIRequest(options, {})
+
+  assert.deepEqual(native.contents[0].parts, [{ text: 'private analysis', thought: true }, { text: 'visible answer' }])
+  assert.equal(openai.messages[0].reasoning_content, 'private analysis')
+  assert.equal(openai.messages[0].content, 'visible answer')
+})
+
+test('adds general agent continuation guidance whenever tools are available', () => {
+  const prepared = prepareAgentExecution({ system: 'base', tools: [{ name: 'read' }] })
+  assert.match(prepared.system, /call that tool instead of ending the turn with a plan/)
+  assert.match(prepared.system, /Keep private analysis and reasoning out of normal answer text/)
+  assert.doesNotMatch(prepared.system, /Task-list progress rules/)
+  assert.equal(prepareAgentExecution({ system: 'base', tools: [] }).system, 'base')
+})
+
+test('adds task-list lifecycle guidance for semantically matching tools', () => {
+  const taskTool = {
+    name: 'work_plan_update',
+    description: 'Replace the current work plan',
+    parameters: {
+      type: 'object',
+      properties: {
+        tasks: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              content: { type: 'string' },
+              status: { type: 'string', enum: ['pending', 'in_progress', 'completed'] },
+            },
+          },
+        },
+      },
+    },
+  }
+  const prepared = prepareAgentExecution({ system: 'base', tools: [taskTool] })
+  assert.match(prepared.system, /Treat the latest successful task-list write as the canonical list/)
+  assert.match(prepared.system, /Do not call the task-list tool unless at least one status or the real task scope changed/)
+  assert.match(prepared.system, /Before the final answer, send one final entire-list update/)
+})
+
+test('temporarily removes task-list tools until a non-task tool result makes progress', () => {
+  const todo = {
+    name: 'todo_write',
+    description: 'Record and update a structured task list',
+    parameters: { type: 'object', properties: { todos: { type: 'array', items: { type: 'object' } } } },
+  }
+  const read = { name: 'read', parameters: { type: 'object' } }
+  const afterTodoOnly = prepareAgentExecution({
+    system: 'base',
+    tools: [todo, read],
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'inspect the project' }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'todo-1', name: 'todo_write', arguments: '{"todos":[]}' }] },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'todo-1', content: [{ type: 'text', text: 'Updated todo list.' }] }] },
+    ],
+  })
+  assert.deepEqual(afterTodoOnly.tools.map((tool) => tool.name), ['read'])
+  assert.match(afterTodoOnly.system, /latest successful write has no intervening non-task tool result/)
+
+  const afterRealProgress = prepareAgentExecution({
+    ...afterTodoOnly,
+    tools: [todo, read],
+    messages: [
+      ...afterTodoOnly.messages,
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'read-1', name: 'read', arguments: '{}' }] },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'read-1', content: [{ type: 'text', text: 'package contents' }] }] },
+    ],
+  })
+  assert.deepEqual(afterRealProgress.tools.map((tool) => tool.name), ['todo_write', 'read'])
+})
+
 test('keeps OpenAI compatibility after convergence removes tools from a tool-call turn', () => {
   assert.equal(shouldUseOpenAICompatibility({
     messages: [
@@ -285,6 +389,39 @@ test('keeps first-pass Gemini native search and removes legacy web tools', () =>
   assert.match(prepared.system, /Treat a successful non-network tool result as authoritative/)
   assert.match(prepared.system, /Never rerun a semantically equivalent local operation/)
   assert.match(prepared.system, /two independent local discovery attempts both return empty/)
+})
+
+test('stops near-equivalent successful web searches while preserving distinct research queries', () => {
+  const tools = [
+    { name: 'gemini_web_search', parameters: { type: 'object' } },
+    { name: 'read', parameters: { type: 'object' } },
+  ]
+  const commonMessages = [
+    { role: 'user', content: [{ type: 'text', text: 'Find the latest stable Python release' }] },
+    { role: 'assistant', content: [{ type: 'tool-call', id: 'search-1', name: 'gemini_web_search', arguments: '{"query":"https://www.python.org/downloads/"}' }] },
+    { role: 'user', content: [{ type: 'tool-result', toolCallId: 'search-1', content: [{ type: 'text', text: 'Official Python downloads page with current release information and source links.' }], isError: false }] },
+  ]
+  const redundant = prepareSearchConvergence({
+    messages: [
+      ...commonMessages,
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'search-2', name: 'gemini_web_search', arguments: '{"query":"\\"latest Python release\\" site:python.org/downloads/"}' }] },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'search-2', content: [{ type: 'text', text: 'Python 3.14.7 is the latest release. Official source: https://www.python.org/downloads/release/python-3147/' }], isError: false }] },
+    ],
+    tools,
+  })
+  assert.equal(redundant.tools.some((tool) => tool.name === 'gemini_web_search'), false)
+  assert.equal(redundant.tools.length, 0)
+  assert.match(redundant.system, /near-equivalent queries/)
+
+  const distinct = prepareSearchConvergence({
+    messages: [
+      ...commonMessages,
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'search-2', name: 'gemini_web_search', arguments: '{"query":"Django security advisories site:python.org"}' }] },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'search-2', content: [{ type: 'text', text: 'Distinct security advisory research result with enough substantive details.' }], isError: false }] },
+    ],
+    tools,
+  })
+  assert.equal(distinct.tools.some((tool) => tool.name === 'gemini_web_search'), true)
 })
 
 test('temporarily suppresses only an exactly repeated local tool operation', () => {

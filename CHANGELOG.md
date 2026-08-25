@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-08-25
+
+### Changed
+
+- Preserve assistant reasoning as Gemini thought history or OpenAI-compatible
+  `reasoning_content` instead of replaying private analysis as normal answer
+  text.
+- Add general execution guidance that keeps tool-capable Gemini turns working
+  until completion or a genuine user-input blocker.
+- Converge near-equivalent successful Gemini native searches and force the
+  following model step to answer from existing evidence, preventing fallback
+  through legacy search, skills, or shell-based network access.
+
+### Fixed
+
+- Sanitize every third-party tool JSON Schema before both Gemini native and
+  OpenAI-compatible requests. Missing, nullable, union-style, and nested types
+  are converted to provider-valid declarations without task-specific patches.
+- Keep task-list wording and status monotonic across multi-step work, suppress
+  repeated task-list rewrites until a non-task tool result makes progress, and
+  require a final completed list before the answer.
+- Prevent Gemini from ending a tool-capable turn with planning text while
+  useful work remains.
+
+### Tests
+
+- Add regression coverage for untyped third-party schemas, reasoning-history
+  separation, task-list lifecycle enforcement, and near-equivalent search
+  convergence while preserving distinct research queries.
+- Verify real dsh sessions using `write`, `edit`, `glob`, `grep`, `read`,
+  `read_image`, `pwsh`, `todo_write`, and Gemini native web search.
+
 ## [0.1.4] - 2026-08-25
 
 ### Changed
@@ -163,7 +195,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Repair missing PowerShell tool descriptions and remove stray write/edit
   justifications before forwarding tool schemas to Gemini.
 
-[Unreleased]: https://github.com/Jyleaves/dsh-gemini-aistudio/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/Jyleaves/dsh-gemini-aistudio/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/Jyleaves/dsh-gemini-aistudio/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/Jyleaves/dsh-gemini-aistudio/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/Jyleaves/dsh-gemini-aistudio/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/Jyleaves/dsh-gemini-aistudio/compare/v0.1.1...v0.1.2
