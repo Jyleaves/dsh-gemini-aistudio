@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-08-26
+
+### Changed
+
+- Resolve Chinese relative-time phrases with written numerals, preserve the
+  actual human request when dsh injects runtime context as user-role messages,
+  and reject search evidence outside an explicitly requested rolling window.
+- Reuse a uniquely identified URL from the prior grounded result when the user
+  asks to inspect that source, without hard-coding sites, owners, or projects.
+
+### Fixed
+
+- Drop incomplete objects from schema-defined tool arrays, preventing malformed
+  task-list entries such as status-only items from reaching dsh tools.
+- Decode an accidentally double-escaped `.json` document only when the decoded
+  content passes strict JSON parsing; valid JSON and non-JSON files are left
+  unchanged.
+- Treat textual `RESOURCE_EXHAUSTED`, quota, and rate-limit stream errors as
+  `RATE_LIMIT` even when the provider does not return a numeric HTTP status.
+- Prevent settled subagent identifiers from being reused as background-job IDs.
+
+### Tests
+
+- Add unit and streaming regressions for incomplete required array items,
+  double-escaped JSON writes, textual quota errors, relative-time handling, and
+  prior-source URL Context. The complete automated suite passes 76 tests.
+- Verify a fresh dsh Web conversation using Gemini Flash Lite Latest: task-list
+  creation, JSON write, read-back, strict external parsing, and final task
+  completion all succeeded without tool-call errors. Asteria recovered two
+  upstream 429 responses by rotating accounts and replaying the same request.
+
 ## [0.1.8] - 2026-08-26
 
 ### Added

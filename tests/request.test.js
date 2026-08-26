@@ -249,6 +249,54 @@ test('repairs nested arrays for boolean, integer, enum, and object item schemas'
   )
 })
 
+test('drops incomplete required objects from arbitrary tool arrays', () => {
+  const schema = {
+    type: 'object',
+    required: ['todos'],
+    properties: {
+      todos: {
+        type: 'array',
+        items: {
+          type: 'object',
+          required: ['content', 'status'],
+          properties: {
+            content: { type: 'string' },
+            status: { type: 'string', enum: ['pending', 'in_progress', 'completed'] },
+          },
+        },
+      },
+    },
+  }
+  assert.deepEqual(
+    normalizeToolArguments('todo_write', {
+      todos: [
+        { content: 'Inspect logs', status: 'completed' },
+        { status: 'pending' },
+        { content: 'Run tests' },
+        null,
+      ],
+    }, schema),
+    { todos: [{ content: 'Inspect logs', status: 'completed' }] },
+  )
+})
+
+test('decodes a double-escaped strict JSON document before a write call', () => {
+  const escaped = '[\\n  {\\"name\\": \\"alpha\\", \\"score\\": null}\\n]'
+  assert.equal(
+    normalizeToolArguments('write', JSON.stringify({ file_path: 'report.json', content: escaped })),
+    JSON.stringify({ file_path: 'report.json', content: '[\n  {"name": "alpha", "score": null}\n]' }),
+  )
+  const valid = '{"message":"line one\\nline two"}'
+  assert.equal(
+    normalizeToolArguments('write', JSON.stringify({ file_path: 'report.json', content: valid })),
+    JSON.stringify({ file_path: 'report.json', content: valid }),
+  )
+  assert.equal(
+    normalizeToolArguments('write', JSON.stringify({ file_path: 'report.txt', content: escaped })),
+    JSON.stringify({ file_path: 'report.txt', content: escaped }),
+  )
+})
+
 test('conservatively removes streamed JSON leakage after an unambiguous enum value', () => {
   const schema = {
     type: 'object',
@@ -387,6 +435,7 @@ test('adds general agent continuation guidance whenever tools are available', ()
   assert.match(prepared.system, /check the supplied JSON Schema/)
   assert.match(prepared.system, /failed tool result is not progress/)
   assert.match(prepared.system, /File existence alone proves neither content quality nor format correctness/)
+  assert.match(prepared.system, /subagent identifier is not a background-job identifier/)
   assert.doesNotMatch(prepared.system, /Task-list progress rules/)
   assert.equal(prepareAgentExecution({ system: 'base', tools: [] }).system, 'base')
 })
@@ -685,6 +734,86 @@ test('anchors relative-date web research to the runtime date instead of model me
   assert.match(search.description, /Exact requested rolling window for "past 24 hours": 2026-08-25/)
 })
 
+test('anchors Chinese 最近 N 天 phrasing to an exact rolling window', () => {
+  const raw = normalizeToolArguments(
+    'gemini_web_search',
+    '{"query":"AI chip news"}',
+    undefined,
+    {
+      latestUserText: '最近两天有什么重要消息？',
+      now: new Date(2026, 7, 26, 12, 0, 0),
+    },
+  )
+  const query = JSON.parse(raw).query
+  assert.match(query, /Exact requested rolling window for "最近两天": 2026-08-24/)
+  assert.match(query, /through 2026-08-26/)
+})
+
+test('does not let plugin role-user injections replace the human temporal request', () => {
+  const prepared = prepareSearchConvergence({
+    messages: [
+      {
+        role: 'user',
+        source: { kind: 'user' },
+        content: [{ type: 'text', text: '最近两天有什么重要消息？' }],
+      },
+      {
+        role: 'user',
+        source: { kind: 'skill-catalog' },
+        content: [{ type: 'text', text: 'Search latest recent current information.' }],
+      },
+    ],
+    tools: [{ name: 'gemini_web_search', parameters: { type: 'object' } }],
+  }, 6, new Date(2026, 7, 26, 12, 0, 0))
+  assert.match(prepared.system, /Exact requested rolling window for "最近两天": 2026-08-24/)
+  assert.doesNotMatch(prepared.system, /Exact requested rolling window for "latest"/)
+})
+
+test('reuses a uniquely referenced prior source URL for URL Context without target hardcoding', async () => {
+  const adapter = new GeminiAdapter({
+    baseURL: 'http://127.0.0.1:8080',
+    provider: 'aistudio-gemini',
+    resolveApiKey: async () => 'test-key',
+    models: ['gemini-test'],
+  })
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (_url, init) => {
+    return new Response('data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"audit-1","function":{"name":"gemini_web_search","arguments":"{\\"query\\":\\"verify prior source\\"}"}}]},"finish_reason":"tool_calls"}]}\n\ndata: [DONE]\n\n', {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    })
+  }
+  try {
+    const priorUrl = 'https://example.test/canonical-report'
+    const options = {
+      model: 'gemini-test',
+      tools: [{
+        name: 'gemini_web_search',
+        parameters: { type: 'object', required: ['query'], properties: { query: { type: 'string' } } },
+      }],
+      messages: [
+        { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'Find two reports' }] },
+        { role: 'assistant', content: [{ type: 'tool-call', id: 'search-1', name: 'gemini_web_search', arguments: '{"query":"reports"}' }] },
+        { role: 'user', source: { kind: 'tool' }, content: [{
+          type: 'tool-result',
+          toolCallId: 'search-1',
+          content: [{ type: 'text', text: `Exact URLs returned by provider grounding metadata (copy verbatim):\n1. ${priorUrl} — Example Labs [google_search]\n2. https://other.test/news — Other News [google_search]` }],
+          isError: false,
+        }] },
+        { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '请直接核对刚才的 Example Labs 来源页面' }] },
+        { role: 'user', source: { kind: 'skill-catalog' }, content: [{ type: 'text', text: 'runtime injection' }] },
+      ],
+    }
+    const chunks = []
+    for await (const chunk of adapter.stream(options)) chunks.push(chunk)
+    const call = chunks.find((chunk) => chunk.type === 'block-end' && chunk.block?.type === 'tool-call')?.block
+    assert.match(call.arguments, /https:\/\/example\.test\/canonical-report/)
+    assert.doesNotMatch(call.arguments, /https:\/\/other\.test\/news/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
 test('provides actionable recovery for common dsh tool failures without guessing data', () => {
   const cases = [
     {
@@ -876,6 +1005,15 @@ test('registers Gemini native search with provider-valid JSON Schema', () => {
     },
   })
   assert.deepEqual(search.output.schema.required, ['text', 'sources', 'supports', 'model', 'query', 'googleSearch', 'urlContext'])
+  const rendered = search.output.render(null, {
+    text: 'candidate result',
+    query: 'news\nExact requested rolling window for "最近两天": 2026-08-24 12:00:00 through 2026-08-26 12:00:00.',
+    sources: [{ uri: 'https://example.test/news', title: 'News', kind: 'google_search' }],
+    supports: [],
+  })[0].text
+  assert.match(rendered, /Temporal acceptance gate/)
+  assert.match(rendered, /Omit every out-of-window item/)
+  assert.match(rendered, /2026-08-24.*through 2026-08-26/)
 })
 
 test('Gemini native lookup enables Google Search and URL Context together', async () => {
@@ -1133,6 +1271,99 @@ test('applies runtime sandbox and glob repairs through the streaming adapter', a
     { type: 'tool-call', id: 'call_write', name: 'write', arguments: '{"file_path":"note.txt","content":"ok"}' },
     { type: 'tool-call', id: 'call_grep', name: 'grep', arguments: '{"pattern":"TODO","include":"{*.js,*.ts}"}' },
   ])
+})
+
+test('repairs incomplete list items and double-escaped JSON through the streaming adapter', async () => {
+  const escaped = '[\\n  {\\"name\\": \\"alpha\\"}\\n]'
+  const event = {
+    choices: [{
+      delta: {
+        tool_calls: [
+          {
+            index: 0,
+            id: 'call_todo',
+            function: {
+              name: 'todo_write',
+              arguments: JSON.stringify({
+                todos: [
+                  { content: 'Inspect logs', status: 'completed' },
+                  { status: 'pending' },
+                ],
+              }),
+            },
+          },
+          {
+            index: 1,
+            id: 'call_write',
+            function: {
+              name: 'write',
+              arguments: JSON.stringify({ file_path: 'report.json', content: escaped }),
+            },
+          },
+        ],
+      },
+      finish_reason: 'tool_calls',
+    }],
+  }
+  const { chunks } = await collectMockedStream(streamResponse([`data: ${JSON.stringify(event)}\n\ndata: [DONE]\n\n`]), {
+    model: 'gemini-test',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'inspect and save results' }] }],
+    tools: [
+      {
+        name: 'todo_write',
+        parameters: {
+          type: 'object',
+          required: ['todos'],
+          properties: {
+            todos: {
+              type: 'array',
+              items: {
+                type: 'object',
+                required: ['content', 'status'],
+                properties: {
+                  content: { type: 'string' },
+                  status: { type: 'string', enum: ['pending', 'in_progress', 'completed'] },
+                },
+              },
+            },
+          },
+        },
+      },
+      {
+        name: 'write',
+        parameters: {
+          type: 'object',
+          required: ['file_path', 'content'],
+          properties: { file_path: { type: 'string' }, content: { type: 'string' } },
+        },
+      },
+    ],
+  })
+
+  validateStrictStream(chunks)
+  const calls = chunks
+    .filter((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call')
+    .map((chunk) => chunk.block)
+  assert.deepEqual(JSON.parse(calls[0].arguments), {
+    todos: [{ content: 'Inspect logs', status: 'completed' }],
+  })
+  assert.deepEqual(JSON.parse(calls[1].arguments), {
+    file_path: 'report.json',
+    content: '[\n  {"name": "alpha"}\n]',
+  })
+})
+
+test('classifies textual Gemini quota exhaustion as a rate limit', async () => {
+  const response = streamResponse([
+    `data: ${JSON.stringify({ error: { code: 'RESOURCE_EXHAUSTED', message: '当前账号配额用完' } })}\n\n`,
+  ])
+  await assert.rejects(
+    () => collectMockedStream(response, {
+      model: 'gemini-test',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'continue' }] }],
+    }),
+    (error) => error?.code === 'RATE_LIMIT' && /配额用完/.test(error.message),
+  )
 })
 
 test('reclassifies fragmented internal runtime echoes as reasoning instead of answer text', async () => {
