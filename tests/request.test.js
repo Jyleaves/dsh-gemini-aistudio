@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { buildGeminiRequest, buildOpenAIRequest, sanitizeToolSchema } from '../lib/request.js'
-import { GeminiAdapter, apply, normalizeToolArguments, prepareAgentExecution, prepareSearchConvergence, reasoningMetadata, runNativeWebLookup, shouldUseOpenAICompatibility } from '../lib/index.js'
+import { GeminiAdapter, apply, collectPriorClaimVerifications, collectPriorSearchSources, compactResearchFinalText, normalizeToolArguments, prepareAgentExecution, prepareSearchConvergence, reasoningMetadata, renderNativeWebLookup, researchArtifactState, runNativeClaimVerification, runNativeWebLookup, shouldUseOpenAICompatibility } from '../lib/index.js'
 
 function streamResponse(chunks) {
   const encoder = new TextEncoder()
@@ -67,6 +67,37 @@ test('repairs missing pwsh description without changing other tools', () => {
   assert.equal(normalizeToolArguments('pwsh', '{"command":"Get-Date"}'), '{"command":"Get-Date","description":"Run PowerShell command"}')
   assert.equal(normalizeToolArguments('pwsh', '{"command":"Get-Date","description":"Read the date"}'), '{"command":"Get-Date","description":"Read the date"}')
   assert.equal(normalizeToolArguments('read', '{"path":"README.md"}'), '{"path":"README.md"}')
+})
+
+test('blocks shell-based external web fallback only after Gemini native search failed', () => {
+  const blocked = normalizeToolArguments(
+    'pwsh',
+    { command: 'python -c "import urllib.request; print(urllib.request.urlopen(\'https://example.com\').read())"' },
+    undefined,
+    { blockExternalWebFallback: true },
+  )
+  assert.match(blocked.command, /External web fallback through PowerShell is disabled/)
+  assert.match(blocked.description, /Block external web fallback/)
+
+  assert.equal(
+    normalizeToolArguments('pwsh', '{"command":"Get-Content README.md"}', undefined, { blockExternalWebFallback: true }),
+    '{"command":"Get-Content README.md","description":"Run PowerShell command"}',
+  )
+  assert.equal(
+    normalizeToolArguments('pwsh', '{"command":"Invoke-RestMethod http://127.0.0.1:8080/health"}', undefined, { blockExternalWebFallback: true }),
+    '{"command":"Invoke-RestMethod http://127.0.0.1:8080/health","description":"Run PowerShell command"}',
+  )
+})
+
+test('removes edit-only fields from update_goal completion calls', () => {
+  assert.equal(
+    normalizeToolArguments('update_goal', '{"action":"complete","goal_id":"goal-1","revision":2,"objective":"repeat","max_goal_rounds":5}'),
+    '{"action":"complete","goal_id":"goal-1","revision":2}',
+  )
+  assert.equal(
+    normalizeToolArguments('update_goal', '{"action":"edit","goal_id":"goal-1","revision":2,"objective":"revised","max_goal_rounds":6}'),
+    '{"action":"edit","goal_id":"goal-1","revision":2,"objective":"revised","max_goal_rounds":6}',
+  )
 })
 
 test('removes orphaned escalation justification for every tool', () => {
@@ -178,6 +209,44 @@ test('drops optional null scalars and safely coerces common Gemini scalar mismat
   assert.equal(
     normalizeToolArguments('subagent', '{"run_in_background":null,"timeout_ms":"30000","temperature":"0.25","status":"COMPLETED","label":7}', schema),
     '{"timeout_ms":30000,"temperature":0.25,"status":"completed","label":"7"}',
+  )
+})
+
+test('repairs numeric arguments to explicit JSON Schema bounds', () => {
+  const schema = {
+    type: 'object',
+    properties: {
+      offset: { type: 'integer', minimum: 1 },
+      limit: { type: 'integer', exclusiveMinimum: 0, maximum: 2000 },
+    },
+  }
+  assert.equal(
+    normalizeToolArguments('read', '{"offset":0,"limit":5000}', schema),
+    '{"offset":1,"limit":2000}',
+  )
+  assert.equal(
+    normalizeToolArguments('read', '{"offset":"0","limit":"20"}', schema),
+    '{"offset":1,"limit":20}',
+  )
+})
+
+test('preserves parent numeric bounds when a nullable parameter uses anyOf', () => {
+  const schema = {
+    type: 'object',
+    properties: {
+      offset: {
+        anyOf: [{ type: 'integer' }, { type: 'null' }],
+        minimum: 1,
+      },
+    },
+  }
+  assert.equal(
+    normalizeToolArguments('read', '{"offset":0}', schema),
+    '{"offset":1}',
+  )
+  assert.equal(
+    normalizeToolArguments('read', '{"offset":null}', schema),
+    '{"offset":null}',
   )
 })
 
@@ -323,6 +392,22 @@ test('conservatively removes streamed JSON leakage after an unambiguous enum val
   )
   assert.deepEqual(
     normalizeToolArguments('todo_write', {
+      todos: [
+        { content: 'Collect sources', status: 'in_progressghost' },
+        { content: 'Write report', status: 'completedhidden' },
+        { content: 'Verify report', status: 'completed grandson' },
+      ],
+    }, schema),
+    {
+      todos: [
+        { content: 'Collect sources', status: 'in_progress' },
+        { content: 'Write report', status: 'completed' },
+        { content: 'Verify report', status: 'completed' },
+      ],
+    },
+  )
+  assert.deepEqual(
+    normalizeToolArguments('todo_write', {
       todos: [{ content: 'Collect sources', status: 'in_progress_extra' }],
     }, schema),
     { todos: [{ content: 'Collect sources', status: 'in_progress_extra' }] },
@@ -415,7 +500,7 @@ test('repairs untyped third-party tool schemas before either proxy route', async
   assert.equal(openai.tools[0].function.parameters.properties.args.type, 'object')
 })
 
-test('preserves reasoning as reasoning history instead of normal answer text', async () => {
+test('does not replay private reasoning into later Gemini requests', async () => {
   const options = {
     model: 'gemini-3.7-flash',
     messages: [{ role: 'assistant', content: [{ type: 'reasoning', text: 'private analysis' }, { type: 'text', text: 'visible answer' }] }],
@@ -423,8 +508,8 @@ test('preserves reasoning as reasoning history instead of normal answer text', a
   const native = await buildGeminiRequest(options, { googleSearch: false })
   const openai = await buildOpenAIRequest(options, {})
 
-  assert.deepEqual(native.contents[0].parts, [{ text: 'private analysis', thought: true }, { text: 'visible answer' }])
-  assert.equal(openai.messages[0].reasoning_content, 'private analysis')
+  assert.deepEqual(native.contents[0].parts, [{ text: 'visible answer' }])
+  assert.equal('reasoning_content' in openai.messages[0], false)
   assert.equal(openai.messages[0].content, 'visible answer')
 })
 
@@ -663,6 +748,7 @@ test('keeps first-pass Gemini native search and removes legacy web tools', () =>
   assert.match(prepared.system, /Do not use shell commands, package-manager commands, scripts, or local browser tools to access public/)
   assert.match(prepared.system, /Treat a successful non-network tool result as authoritative/)
   assert.match(prepared.system, /Never rerun a semantically equivalent local operation/)
+  assert.match(prepared.system, /Ignore hidden caches, dependency trees, generated artifacts, and binaries/)
   assert.match(prepared.system, /two independent local discovery attempts both return empty/)
 })
 
@@ -699,6 +785,156 @@ test('stops near-equivalent successful web searches while preserving distinct re
   assert.equal(distinct.tools.some((tool) => tool.name === 'gemini_web_search'), true)
 })
 
+test('requires fresh claim verification after every new grounded lookup before research writes', () => {
+  const tools = [
+    { name: 'gemini_web_search', parameters: { type: 'object' } },
+    { name: 'gemini_verify_claims', parameters: { type: 'object' } },
+    { name: 'write', parameters: { type: 'object' } },
+    { name: 'edit', parameters: { type: 'object' } },
+    { name: 'read', parameters: { type: 'object' } },
+  ]
+  const start = [
+    { role: 'user', content: [{ type: 'text', text: '请核实事实并写一份研究报告' }] },
+    { role: 'user', content: [{ type: 'text', text: 'Current runtime context. This snapshot supersedes earlier runtime-context snapshots.' }] },
+    { role: 'user', content: [{ type: 'text', text: '<skill_content name="research-writer">Expanded internal skill instructions.</skill_content>' }] },
+    { role: 'assistant', content: [{ type: 'tool-call', id: 'search-1', name: 'gemini_web_search', arguments: '{"query":"official data"}' }] },
+    { role: 'user', content: [{ type: 'tool-result', toolCallId: 'search-1', content: [{ type: 'text', text: 'Grounded evidence packet with enough substantive source material and exact URLs.' }], isError: false }] },
+  ]
+  const afterSearch = prepareSearchConvergence({ messages: start, tools })
+  assert.equal(afterSearch.tools.some((tool) => tool.name === 'write'), false)
+  assert.equal(afterSearch.tools.some((tool) => tool.name === 'edit'), false)
+  assert.equal(afterSearch.tools.some((tool) => tool.name === 'gemini_verify_claims'), true)
+  assert.match(afterSearch.system, /newer than the latest successful gemini_verify_claims result/)
+
+  const afterVerification = prepareSearchConvergence({
+    messages: [
+      ...start,
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'verify-1', name: 'gemini_verify_claims', arguments: '{"claims":[]}' }] },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'verify-1', content: [{ type: 'text', text: 'Claim verification evidence packet with a successful supported result.' }], isError: false }] },
+    ],
+    tools,
+  })
+  assert.equal(afterVerification.tools.some((tool) => tool.name === 'write'), true)
+  assert.equal(afterVerification.tools.some((tool) => tool.name === 'edit'), true)
+
+  const longDraft = `# Research report\n\n${'A material externally checkable research claim with dates, quantities, institutions, policies, and outcomes. '.repeat(20)}`
+  const afterDraftWrite = prepareSearchConvergence({
+    messages: [
+      ...start,
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'verify-1', name: 'gemini_verify_claims', arguments: '{"claims":[]}' }] },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'verify-1', content: [{ type: 'text', text: 'Claim verification evidence packet with a successful supported result.' }], isError: false }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'write-1', name: 'write', arguments: JSON.stringify({ file_path: 'report.md', content: longDraft }) }] },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'write-1', content: [{ type: 'text', text: 'Wrote report.md successfully.' }], isError: false }] },
+    ],
+    tools,
+  })
+  assert.equal(afterDraftWrite.tools.some((tool) => tool.name === 'write'), false)
+  assert.equal(afterDraftWrite.tools.some((tool) => tool.name === 'edit'), false)
+  assert.equal(afterDraftWrite.tools.some((tool) => tool.name === 'gemini_verify_claims'), true)
+  assert.match(afterDraftWrite.system, /long research draft was written/)
+  assert.match(afterDraftWrite.system, /complete inventory of material claims actually present in that draft/)
+
+  const afterPostDraftEdit = prepareSearchConvergence({
+    messages: [
+      ...start,
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'verify-1', name: 'gemini_verify_claims', arguments: '{"claims":[]}' }] },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'verify-1', content: [{ type: 'text', text: 'Claim verification evidence packet with a successful supported result.' }], isError: false }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'write-1', name: 'write', arguments: JSON.stringify({ file_path: 'report.md', content: longDraft }) }] },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'write-1', content: [{ type: 'text', text: 'Wrote report.md successfully.' }], isError: false }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'verify-2', name: 'gemini_verify_claims', arguments: '{"claims":[]}' }] },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'verify-2', content: [{ type: 'text', text: 'Claim verification evidence packet with a second successful result.' }], isError: false }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'edit-1', name: 'edit', arguments: JSON.stringify({ file_path: 'outputs/final/report.md', old_string: '99 tonnes', new_string: 'the supported amount' }) }] },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'edit-1', content: [{ type: 'text', text: 'Edited outputs/final/report.md successfully.' }], isError: false }] },
+    ],
+    tools,
+  })
+  assert.equal(afterPostDraftEdit.tools.some((tool) => tool.name === 'write'), false)
+  assert.equal(afterPostDraftEdit.tools.some((tool) => tool.name === 'edit'), false)
+  assert.equal(afterPostDraftEdit.tools.some((tool) => tool.name === 'gemini_verify_claims'), true)
+  assert.match(afterPostDraftEdit.system, /long research draft was written/)
+
+  const afterNewSearch = prepareSearchConvergence({
+    messages: [
+      ...start,
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'verify-1', name: 'gemini_verify_claims', arguments: '{"claims":[]}' }] },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'verify-1', content: [{ type: 'text', text: 'Claim verification evidence packet with a successful supported result.' }], isError: false }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'search-2', name: 'gemini_web_search', arguments: '{"query":"different precise number"}' }] },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'search-2', content: [{ type: 'text', text: 'A different grounded evidence packet with a newly discovered precise value.' }], isError: false }] },
+    ],
+    tools,
+  })
+  assert.equal(afterNewSearch.tools.some((tool) => tool.name === 'write'), false)
+  assert.equal(afterNewSearch.tools.some((tool) => tool.name === 'edit'), false)
+})
+
+test('requires a separate fact-check artifact before research goal completion', () => {
+  const packet = [
+    'Claim verification evidence packet',
+    '',
+    'Sources (citation whitelist; copy URLs exactly):',
+    '[S1] https://official.example/report — Official report [url_context]',
+    '',
+    'Verification outcomes:',
+    '[V1] PARTIAL: The report supports only the date.',
+    '  Sources: S1',
+  ].join('\n')
+  const longDraft = `# Research report\n\n${'A material claim with dates, quantities, institutions, and outcomes. '.repeat(30)}`
+  const base = [
+    { role: 'user', content: [{ type: 'text', text: '查最新情况，写一篇研究性文章' }] },
+    { role: 'assistant', content: [{ type: 'tool-call', id: 'verify-1', name: 'gemini_verify_claims', arguments: '{"claims":[]}' }] },
+    { role: 'user', content: [{ type: 'tool-result', toolCallId: 'verify-1', content: [{ type: 'text', text: packet }], isError: false }] },
+    { role: 'assistant', content: [{ type: 'tool-call', id: 'write-report', name: 'write', arguments: JSON.stringify({ file_path: 'outputs/report.md', content: longDraft }) }] },
+    { role: 'user', content: [{ type: 'tool-result', toolCallId: 'write-report', content: [{ type: 'text', text: 'Wrote outputs/report.md.' }], isError: false }] },
+    { role: 'assistant', content: [{ type: 'tool-call', id: 'verify-2', name: 'gemini_verify_claims', arguments: '{"claims":[]}' }] },
+    { role: 'user', content: [{ type: 'tool-result', toolCallId: 'verify-2', content: [{ type: 'text', text: packet }], isError: false }] },
+  ]
+  const tools = [
+    { name: 'gemini_web_search', parameters: { type: 'object' } },
+    { name: 'gemini_verify_claims', parameters: { type: 'object' } },
+    { name: 'write', parameters: { type: 'object' } },
+    { name: 'update_goal', parameters: { type: 'object' } },
+  ]
+  const artifacts = researchArtifactState(base)
+  assert.equal(artifacts.hasLongDraft, true)
+  assert.equal(artifacts.hasFactCheckArtifact, false)
+
+  const pending = prepareSearchConvergence({ messages: base, tools })
+  assert.equal(pending.tools.some((tool) => tool.name === 'write'), true)
+  assert.equal(pending.tools.some((tool) => tool.name === 'update_goal'), false)
+  assert.match(pending.system, /no separate fact-check artifact/)
+
+  const factCheck = '# 事实核查表\n\n| 编号 | 状态 | 事实 | 来源 |\n|---|---|---|---|\n| V1 | PARTIAL | The report supports only the date. | https://official.example/report |'
+  const completeMessages = [
+    ...base,
+    { role: 'assistant', content: [{ type: 'tool-call', id: 'write-facts', name: 'write', arguments: JSON.stringify({ file_path: 'outputs/report-fact-check.md', content: factCheck }) }] },
+    { role: 'user', content: [{ type: 'tool-result', toolCallId: 'write-facts', content: [{ type: 'text', text: 'Wrote outputs/report-fact-check.md.' }], isError: false }] },
+  ]
+  assert.equal(researchArtifactState(completeMessages).hasFactCheckArtifact, true)
+  const complete = prepareSearchConvergence({ messages: completeMessages, tools })
+  assert.equal(complete.tools.some((tool) => tool.name === 'update_goal'), true)
+})
+
+test('compacts long research finals and reports incomplete artifact state honestly', () => {
+  const raw = [
+    '已完成研究报告。',
+    '`outputs/report.docx`',
+    '`outputs/report.md`',
+    '# 研究报告正文',
+    '正文'.repeat(2_000),
+    '# 事实核查表',
+    '好的，我已经理解您的需求。<execute_bash>旧任务计划</execute_bash>',
+  ].join('\n\n')
+  const compact = compactResearchFinalText(raw, {
+    artifacts: { hasLongDraft: true, hasFactCheckArtifact: false, draftPaths: ['outputs/report.md'], factCheckPaths: [] },
+    verifications: [{ status: 'VERIFIED' }, { status: 'PARTIAL' }],
+  })
+  assert.match(compact, /独立事实核查表尚未成功写入文件/)
+  assert.match(compact, /outputs\/report\.docx/)
+  assert.match(compact, /VERIFIED 1 条，PARTIAL 1 条/)
+  assert.doesNotMatch(compact, /execute_bash|研究报告正文/)
+  assert.ok(compact.length < 1_000)
+})
+
 test('suppresses only a repeatedly invalid tool while preserving other tools', () => {
   const prepared = prepareSearchConvergence({
     messages: [
@@ -717,6 +953,22 @@ test('suppresses only a repeatedly invalid tool while preserving other tools', (
   assert.deepEqual(prepared.tools.map((tool) => tool.name), ['read', 'todo_write'])
   assert.match(prepared.system, /repeatedly produced equivalent failures/)
   assert.match(prepared.system, /subagent/)
+})
+
+test('suppresses pwsh after one blocked external web fallback', () => {
+  const prepared = prepareSearchConvergence({
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: '核实最近消息' }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'shell-1', name: 'pwsh', arguments: '{"command":"throw ..."}' }] },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'shell-1', content: [{ type: 'text', text: 'External web fallback through PowerShell is disabled after Gemini native search failed.' }], isError: true }] },
+    ],
+    tools: [
+      { name: 'pwsh', parameters: { type: 'object' } },
+      { name: 'read', parameters: { type: 'object' } },
+    ],
+  })
+  assert.deepEqual(prepared.tools.map((tool) => tool.name), ['read'])
+  assert.match(prepared.system, /not a substitute for gemini_web_search/)
 })
 
 test('anchors relative-date web research to the runtime date instead of model memory', () => {
@@ -812,6 +1064,135 @@ test('reuses a uniquely referenced prior source URL for URL Context without targ
   } finally {
     globalThis.fetch = originalFetch
   }
+})
+
+test('collects exact grounded source URLs across every prior lookup in the turn', () => {
+  const messages = [
+    { role: 'user', content: [{
+      type: 'tool-result',
+      isError: false,
+      content: [{ type: 'text', text: 'Exact URLs returned by provider grounding metadata (copy verbatim):\n1. https://one.example/report — First report [google_search]' }],
+    }] },
+    { role: 'user', content: [{
+      type: 'tool-result',
+      isError: false,
+      content: [{ type: 'text', text: 'Grounded evidence packet\n\nSources (citation whitelist; copy URLs exactly):\n[S1] https://two.example/news — Second report [url_context]\n[S2] https://one.example/report — Duplicate [google_search]' }],
+    }] },
+  ]
+  assert.deepEqual(collectPriorSearchSources(messages), [
+    { uri: 'https://one.example/report', title: 'First report' },
+    { uri: 'https://two.example/news', title: 'Second report' },
+  ])
+})
+
+test('prevents research file writes from inventing citation URLs', () => {
+  const normalized = JSON.parse(normalizeToolArguments(
+    'write',
+    JSON.stringify({
+      file_path: 'report.md',
+      content: '[grounded](https://official.example/report) [invented](https://official.example/report/fake-slug)',
+    }),
+    undefined,
+    {
+      latestUserText: '请核查事实并写一份研究报告',
+      priorSearchSources: [{ uri: 'https://official.example/report', title: 'Official report' }],
+    },
+  ))
+  assert.match(normalized.content, /https:\/\/official\.example\/report/)
+  assert.doesNotMatch(normalized.content, /fake-slug/)
+  assert.match(normalized.content, /\[unverified URL omitted\]/)
+})
+
+test('downgrades verified labels when a fact-check write uses non-whitelisted URLs', () => {
+  const normalized = JSON.parse(normalizeToolArguments(
+    'write',
+    JSON.stringify({
+      file_path: 'fact-check.md',
+      content: '# 事实核查表\n| 事实 | 来源 | 状态 |\n|---|---|---|\n| 示例 | https://invented.example/home | 已核（精确支持） |\n\n全部事实验证通过。',
+    }),
+    undefined,
+    {
+      latestUserText: '请核查事实并写一份研究报告',
+      priorSearchSources: [{ uri: 'https://official.example/report', title: 'Official report' }],
+    },
+  ))
+  assert.match(normalized.content, /\[unverified URL omitted\]/)
+  assert.match(normalized.content, /待核（来源 URL 未通过白名单）/)
+  assert.match(normalized.content, /不能认定全部事实验证通过/)
+  assert.doesNotMatch(normalized.content, /\| 已核/)
+})
+
+test('collects the latest structured claim-verification statuses and exact URLs', () => {
+  const packet = `Claim verification evidence packet
+
+Sources (citation whitelist; copy URLs exactly):
+[S1] https://official.example/one — First source [url_context]
+[S2] https://official.example/two — Second source [url_context]
+
+Verification outcomes:
+[V1] VERIFIED: The project opened on 1 May.
+  Sources: S1
+  Provider: V1 VERIFIED
+[V2] PARTIAL: The platform opened on 2 May and produced 99 tonnes.
+  Sources: S2
+  Provider: V2 PARTIAL: the opening date is supported but the output is not.`
+  const messages = [{ role: 'user', content: [{ type: 'tool-result', isError: false, content: [{ type: 'text', text: packet }] }] }]
+  assert.deepEqual(collectPriorClaimVerifications(messages), [
+    { id: 'V1', status: 'VERIFIED', claim: 'The project opened on 1 May.', sourceUrls: ['https://official.example/one'] },
+    { id: 'V2', status: 'PARTIAL', claim: 'The platform opened on 2 May and produced 99 tonnes.', sourceUrls: ['https://official.example/two'] },
+  ])
+})
+
+test('prevents a fact-check table from laundering partial or unsubmitted claims as verified', () => {
+  const priorClaimVerifications = [
+    { id: 'V1', status: 'VERIFIED', claim: 'The project opened on 1 May.', sourceUrls: ['https://official.example/one'] },
+    { id: 'V2', status: 'PARTIAL', claim: 'The platform opened on 2 May and produced 99 tonnes.', sourceUrls: ['https://official.example/two'] },
+    { id: 'V3', status: 'UNSUPPORTED', claim: 'The equipment reduced costs by 35 percent.', sourceUrls: ['https://official.example/three'] },
+  ]
+  const normalized = JSON.parse(normalizeToolArguments(
+    'write',
+    JSON.stringify({
+      file_path: 'fact-check.md',
+      content: '# 事实核查表\n\n所有引用事实均为**已核（VERIFIED）**，不存在无法追溯的数据。\n\n| 事实 | 状态 | 结论 | 来源 |\n|---|---|---|---|\n| The project opened on 1 May. | **VERIFIED / 已核** | **精确支持。** | https://official.example/one |\n| The platform opened on 2 May and produced 99 tonnes. | **VERIFIED / 已核** | **精确支持。** | https://official.example/two |\n| An unrelated forecast says revenue will double. | **VERIFIED / 已核** | **精准支持。** | https://official.example/one |',
+    }),
+    undefined,
+    {
+      latestUserText: 'Write a research report with a fact-check table.',
+      priorSearchSources: priorClaimVerifications.flatMap((item) => item.sourceUrls.map((uri) => ({ uri, title: '' }))),
+      priorClaimVerifications,
+    },
+  ))
+  assert.match(normalized.content, /The project opened on 1 May\. \| \*\*VERIFIED/)
+  assert.match(normalized.content, /The platform opened on 2 May.*PARTIAL（仅部分支持/)
+  assert.match(normalized.content, /unrelated forecast.*UNVERIFIED（未提交严格核验/)
+  assert.doesNotMatch(normalized.content, /PARTIAL（仅部分支持[^\n]*\/\*\*PARTIAL/)
+  assert.doesNotMatch(normalized.content, /The platform opened on 2 May[^\n]*(?:精确|精准)支持/)
+  assert.doesNotMatch(normalized.content, /unrelated forecast[^\n]*(?:精确|精准)支持/)
+  assert.match(normalized.content, /未提交 `gemini_verify_claims` 严格核验/)
+  assert.doesNotMatch(normalized.content, /所有引用事实均为\*\*已核/)
+  assert.match(normalized.content, /适配器严格核验结果（自动审计）/)
+  assert.match(normalized.content, /\| V3 \| UNSUPPORTED \| The equipment reduced costs by 35 percent\./)
+  assert.match(normalized.content, /https:\/\/official\.example\/three/)
+})
+
+test('maps translated fact-check rows by verification number and exact URL', () => {
+  const normalized = JSON.parse(normalizeToolArguments(
+    'write',
+    JSON.stringify({
+      file_path: 'fact-check.md',
+      content: '# 事实核查表\n\n| 序号 | 事实 | 状态 | 来源 |\n|---|---|---|---|\n| 1 | 该项目于5月1日正式开放。 | **UNVERIFIED（未提交严格核验）** | https://official.example/one |',
+    }),
+    undefined,
+    {
+      latestUserText: '请核查事实并写一份研究报告',
+      priorSearchSources: [{ uri: 'https://official.example/one', title: '' }],
+      priorClaimVerifications: [
+        { id: 'V1', status: 'VERIFIED', claim: 'The project opened on 1 May.', sourceUrls: ['https://official.example/one'] },
+      ],
+    },
+  ))
+  assert.match(normalized.content, /该项目于5月1日正式开放。 \| \*\*VERIFIED \/ 已核\*\*/)
+  assert.doesNotMatch(normalized.content, /UNVERIFIED（未提交严格核验）/)
 })
 
 test('provides actionable recovery for common dsh tool failures without guessing data', () => {
@@ -996,6 +1377,7 @@ test('registers Gemini native search with provider-valid JSON Schema', () => {
     get: () => undefined,
   })
   const search = registered.find((tool) => tool.name === 'gemini_web_search')
+  const verifier = registered.find((tool) => tool.name === 'gemini_verify_claims')
   assert.deepEqual(search.parameters, {
     type: 'object',
     additionalProperties: false,
@@ -1005,6 +1387,7 @@ test('registers Gemini native search with provider-valid JSON Schema', () => {
     },
   })
   assert.deepEqual(search.output.schema.required, ['text', 'sources', 'supports', 'model', 'query', 'googleSearch', 'urlContext'])
+  assert.equal(search.timeoutMs, 240_000)
   const rendered = search.output.render(null, {
     text: 'candidate result',
     query: 'news\nExact requested rolling window for "最近两天": 2026-08-24 12:00:00 through 2026-08-26 12:00:00.',
@@ -1014,6 +1397,68 @@ test('registers Gemini native search with provider-valid JSON Schema', () => {
   assert.match(rendered, /Temporal acceptance gate/)
   assert.match(rendered, /Omit every out-of-window item/)
   assert.match(rendered, /2026-08-24.*through 2026-08-26/)
+  assert.deepEqual(verifier.parameters.required, ['claims'])
+  assert.deepEqual(verifier.parameters.properties.claims.items.required, ['claim', 'sourceUrls'])
+  assert.deepEqual(verifier.output.schema.required, ['text', 'sources', 'supports', 'model', 'query', 'googleSearch', 'urlContext', 'requestedClaims', 'verifications'])
+  assert.deepEqual(verifier.output.schema.properties.sources.items.required, ['uri', 'title', 'kind'])
+  assert.deepEqual(verifier.output.schema.properties.requestedClaims.items.required, ['id', 'claim', 'sourceUrls'])
+  assert.deepEqual(verifier.output.schema.properties.verifications.items.required, ['id', 'claim', 'sourceUrls', 'status', 'details'])
+  assert.equal(verifier.timeoutMs, 900_000)
+})
+
+test('shares newly grounded sources with claim verification in the same live agent', async () => {
+  const registered = []
+  apply({
+    llm: { registerAdapter: () => () => {} },
+    tools: { register: (tool) => { registered.push(tool); return () => {} } },
+    effect: () => () => {},
+    get: (name) => name === 'credentials'
+      ? { resolve: async () => ({ value: 'test-key' }) }
+      : undefined,
+  }, { baseURL: 'http://127.0.0.1:8080', models: ['gemini-selected'] })
+  const search = registered.find((tool) => tool.name === 'gemini_web_search')
+  const verifier = registered.find((tool) => tool.name === 'gemini_verify_claims')
+  const sourceUrl = 'https://vertexaisearch.cloud.google.com/grounding-api-redirect/token='
+  const originalFetch = globalThis.fetch
+  let calls = 0
+  globalThis.fetch = async (_url, init) => {
+    calls += 1
+    const verification = JSON.parse(init.body).tools?.some((tool) => tool.urlContext)
+      && !JSON.parse(init.body).tools?.some((tool) => tool.googleSearch)
+    return new Response(JSON.stringify({
+      candidates: [{
+        content: { parts: [{ text: verification ? 'V1 VERIFIED' : 'Grounded result' }] },
+        ...(verification
+          ? { urlContextMetadata: { urlMetadata: [{ retrievedUrl: sourceUrl, title: 'Official report' }] } }
+          : { groundingMetadata: { groundingChunks: [{ web: { uri: sourceUrl, title: 'Official report' } }] } }),
+      }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } })
+  }
+  try {
+    const agent = { options: { model: 'gemini-selected', messages: [] } }
+    await search.execute({ query: 'find the official report' }, { agent, signal: undefined })
+    const verified = await verifier.execute({
+      claims: [{ claim: 'The report states 42.', sourceUrls: [sourceUrl] }],
+    }, { agent, signal: undefined })
+    assert.equal(calls, 2)
+    assert.equal(verified.text, 'V1 VERIFIED')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('renders compact source and claim evidence without repeating long provider prose', () => {
+  const raw = 'A'.repeat(20_000)
+  const rendered = renderNativeWebLookup({
+    text: raw,
+    query: 'verify current facts',
+    sources: [{ uri: 'https://example.test/report', title: 'Official report', kind: 'google_search' }],
+    supports: [{ claim: 'The report directly supports this claim.', sourceUris: ['https://example.test/report'] }],
+  })[0].text
+  assert.match(rendered, /\[S1\] https:\/\/example\.test\/report/)
+  assert.match(rendered, /\[C1\] The report directly supports this claim/)
+  assert.doesNotMatch(rendered, new RegExp(raw.slice(0, 100)))
+  assert.ok(rendered.length < 5000)
 })
 
 test('Gemini native lookup enables Google Search and URL Context together', async () => {
@@ -1092,6 +1537,231 @@ test('plain native web research uses Google Search without empty URL Context', a
     assert.match(capturedUrl, /gemini-user-selected:generateContent$/)
     assert.equal(result.model, 'gemini-user-selected')
     assert.equal(result.urlContext, false)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('claim verification reopens only prior grounded URLs with URL Context', async () => {
+  const originalFetch = globalThis.fetch
+  let capturedBody
+  globalThis.fetch = async (_url, init) => {
+    capturedBody = JSON.parse(init.body)
+    return new Response(JSON.stringify({
+      candidates: [{
+        content: { parts: [{ text: 'V1 VERIFIED: the official page directly supports the claim.' }] },
+        urlContextMetadata: { urlMetadata: [{ retrievedUrl: 'https://official.example/report', title: 'Official report' }] },
+      }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } })
+  }
+  try {
+    const result = await runNativeClaimVerification({
+      baseURL: 'http://127.0.0.1:8080',
+      models: ['gemini-test'],
+      resolveApiKey: async () => 'test-key',
+    }, [{ claim: 'The reported value is 42.', sourceUrls: ['https://official.example/report'] }], [
+      { uri: 'https://official.example/report', title: 'Official report' },
+    ], undefined, 'gemini-selected')
+    assert.deepEqual(capturedBody.tools, [{ urlContext: {} }])
+    assert.match(capturedBody.contents[0].parts[0].text, /Do not use Google Search/)
+    assert.equal(result.googleSearch, false)
+    assert.equal(result.urlContext, true)
+    assert.deepEqual(result.requestedClaims, [{
+      id: 'V1',
+      claim: 'The reported value is 42.',
+      sourceUrls: ['https://official.example/report'],
+    }])
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('claim verification rejects a URL that was not returned by grounded search', async () => {
+  await assert.rejects(
+    runNativeClaimVerification({ resolveApiKey: async () => 'test-key' }, [{
+      claim: 'A fabricated source supports this.',
+      sourceUrls: ['https://invented.example/fake'],
+    }], [{ uri: 'https://official.example/report' }], undefined, 'gemini-test'),
+    (error) => error?.code === 'INVALID_ARGS' && /unknown URL/.test(error.message),
+  )
+})
+
+test('claim verification repairs one missing character in a uniquely matching grounded redirect URL', async () => {
+  const originalFetch = globalThis.fetch
+  let capturedBody
+  globalThis.fetch = async (_url, init) => {
+    capturedBody = JSON.parse(init.body)
+    return new Response(JSON.stringify({
+      candidates: [{ content: { parts: [{ text: 'V1 VERIFIED' }] } }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } })
+  }
+  const prefix = 'https://vertexaisearch.cloud.google.com/grounding-api-redirect/'
+  const known = `${prefix}AUZIYQFA8vtshLi8ZOOu2QjDgn8RAXUr70LwlaPPCD6z82pcGk_DNfuLMiVVZeG0z`
+  const missingCharacter = `${prefix}AUZIYFA8vtshLi8ZOOu2QjDgn8RAXUr70LwlaPPCD6z82pcGk_DNfuLMiVVZeG0z`
+  try {
+    const result = await runNativeClaimVerification({
+      baseURL: 'http://127.0.0.1:8080',
+      models: ['gemini-test'],
+      resolveApiKey: async () => 'test-key',
+    }, [{ claim: 'The grounded page supports this claim.', sourceUrls: [missingCharacter] }], [
+      { uri: known, title: 'Grounded report' },
+    ], undefined, 'gemini-test')
+    assert.match(capturedBody.contents[0].parts[0].text, new RegExp(known))
+    assert.deepEqual(result.requestedClaims[0].sourceUrls, [known])
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('claim verification repairs two streamed character corruptions only when the redirect match is unique', async () => {
+  const originalFetch = globalThis.fetch
+  let capturedBody
+  globalThis.fetch = async (_url, init) => {
+    capturedBody = JSON.parse(init.body)
+    return new Response(JSON.stringify({
+      candidates: [{ content: { parts: [{ text: '**V1**\nStatus: VERIFIED\nThe page directly supports the claim.' }] } }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } })
+  }
+  const prefix = 'https://vertexaisearch.cloud.google.com/grounding-api-redirect/'
+  const known = `${prefix}AUZIYQGR_nwS1tk9bFa_RVL2_WokJxBcovuHKadxXS3TUvJF1Zx_ALZ5WWtzefTNOwUJPhgjDGByDY9WrWc-HitdvPc-9uZsuZe854fe0AK4Xe7KsUA3-YizAMq_MrlnxwfCOxDtkkzW65KB94Hba5w__h-h`
+  const corrupted = `${prefix}AUZIYQGR_nwS1tk9bFa_RVL2_WokJxBcovuHKadxXS3TUvJF1Zx_ALZ5WWtzefTNOwUJPhgjDGByDY9WrWc-HitdvPc-9uZsuZe854fe0AK4Xe7KsUA3-YizAMq_MrlnwfwfCOxDtkkzW65KB94Hba5w__h-h`
+  try {
+    const result = await runNativeClaimVerification({
+      baseURL: 'http://127.0.0.1:8080',
+      models: ['gemini-test'],
+      resolveApiKey: async () => 'test-key',
+    }, [{ claim: 'The grounded page supports this claim.', sourceUrls: [corrupted] }], [
+      { uri: known, title: 'Grounded report' },
+    ], undefined, 'gemini-test')
+    assert.match(capturedBody.contents[0].parts[0].text, new RegExp(known))
+    assert.deepEqual(result.requestedClaims[0].sourceUrls, [known])
+    assert.equal(result.verifications[0].status, 'VERIFIED')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('claim verification strips streamed JSON leakage after a complete grounding token', async () => {
+  const originalFetch = globalThis.fetch
+  const exact = 'https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQFzwOLg4Nv05nPgZ2v5of5ovGBchUJkUBACFlTk1n0uWjfwRw4_NgGGMSwEkT6s3OWNh7kQdyVNSCtjZMYXOd2UX2agrmqf5CBoJ6waZJLefL0kDr8cjTuwCfW0r5tOty4x9_4='
+  globalThis.fetch = async (_url, init) => {
+    const body = JSON.parse(init.body)
+    assert.match(body.contents[0].parts[0].text, new RegExp(exact.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+    assert.doesNotMatch(body.contents[0].parts[0].text, /\]\},\{claim:/)
+    return new Response(JSON.stringify({
+      candidates: [{
+        content: { parts: [{ text: 'V1 VERIFIED: supported' }] },
+        urlContextMetadata: { urlMetadata: [{ retrievedUrl: exact, title: 'Official source' }] },
+      }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } })
+  }
+  try {
+    const result = await runNativeClaimVerification(
+      { baseURL: 'http://127.0.0.1:8080', resolveApiKey: async () => 'key', models: ['gemini-test'] },
+      [{ claim: 'Supported claim', sourceUrls: [`${exact}\`]},{claim:`] }],
+      [{ uri: exact, title: 'Official source' }],
+      undefined,
+      'gemini-test',
+    )
+    assert.equal(result.verifications[0].status, 'VERIFIED')
+    assert.deepEqual(result.requestedClaims[0].sourceUrls, [exact])
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('claim verification does not guess between ambiguous one-character redirect matches', async () => {
+  const prefix = 'https://vertexaisearch.cloud.google.com/grounding-api-redirect/'
+  const supplied = `${prefix}${'a'.repeat(40)}X`
+  await assert.rejects(
+    runNativeClaimVerification({ resolveApiKey: async () => 'test-key' }, [{
+      claim: 'An ambiguous source supports this.',
+      sourceUrls: [supplied],
+    }], [
+      { uri: `${prefix}${'a'.repeat(40)}Y` },
+      { uri: `${prefix}${'a'.repeat(40)}Z` },
+    ], undefined, 'gemini-test'),
+    (error) => error?.code === 'INVALID_ARGS' && /unknown URL/.test(error.message),
+  )
+})
+
+test('claim verification keeps whitelisted URL Context sources when metadata is omitted', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    candidates: [{ content: { parts: [{ text: 'V1 UNREACHABLE: URL Context returned no source metadata.' }] } }],
+  }), { status: 200, headers: { 'content-type': 'application/json' } })
+  try {
+    const sourceUrl = 'https://vertexaisearch.cloud.google.com/grounding-api-redirect/known-token='
+    const result = await runNativeClaimVerification({
+      baseURL: 'http://127.0.0.1:8080',
+      models: ['gemini-test'],
+      resolveApiKey: async () => 'test-key',
+    }, [{ claim: 'The report states 42.', sourceUrls: [sourceUrl] }], [
+      { uri: sourceUrl, title: 'Grounded report' },
+    ], undefined, 'gemini-test')
+    assert.equal(result.text, 'V1 UNREACHABLE: URL Context returned no source metadata.')
+    assert.equal(result.verifications[0].status, 'UNREACHABLE')
+    assert.deepEqual(result.sources, [{
+      uri: sourceUrl,
+      title: 'Supplied verification source 1',
+      kind: 'url_context',
+    }])
+    assert.deepEqual(result.supports, [])
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('claim verification rejects a source-only response without per-claim statuses', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    candidates: [{ content: { parts: [{ text: 'model' }] } }],
+  }), { status: 200, headers: { 'content-type': 'application/json' } })
+  try {
+    const sourceUrl = 'https://vertexaisearch.cloud.google.com/grounding-api-redirect/known-token-with-enough-length-1234567890'
+    await assert.rejects(
+      runNativeClaimVerification({
+        baseURL: 'http://127.0.0.1:8080',
+        models: ['gemini-test'],
+        resolveApiKey: async () => 'test-key',
+      }, [{ claim: 'The report states 42.', sourceUrls: [sourceUrl] }], [
+        { uri: sourceUrl, title: 'Grounded report' },
+      ], undefined, 'gemini-test'),
+      (error) => Number(error?.status) === 502 && /no explicit per-claim status/.test(error.message),
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('claim verification preserves more than twelve claims, batches them, and merges structured outcomes', async () => {
+  const originalFetch = globalThis.fetch
+  const bodies = []
+  globalThis.fetch = async (_url, init) => {
+    const body = JSON.parse(init.body)
+    bodies.push(body)
+    const prompt = body.contents[0].parts[0].text
+    const ids = [...prompt.matchAll(/^(V\d+)\. Claim:/gm)].map((match) => match[1])
+    return new Response(JSON.stringify({
+      candidates: [{ content: { parts: [{ text: ids.map((id) => `${id} VERIFIED: supported`).join('\n') }] } }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } })
+  }
+  const prefix = 'https://vertexaisearch.cloud.google.com/grounding-api-redirect/'
+  const claims = Array.from({ length: 13 }, (_value, index) => ({
+    claim: `Claim ${index + 1}`,
+    sourceUrls: [`${prefix}${String(index).repeat(40)}`],
+  }))
+  try {
+    const result = await runNativeClaimVerification({
+      baseURL: 'http://127.0.0.1:8080',
+      models: ['gemini-test'],
+      resolveApiKey: async () => 'test-key',
+    }, claims, claims.map((item) => ({ uri: item.sourceUrls[0] })), undefined, 'gemini-test')
+    assert.equal(bodies.length, 4)
+    assert.deepEqual(bodies.map((body) => (body.contents[0].parts[0].text.match(/^V\d+\. Claim:/gm) ?? []).length), [4, 4, 4, 1])
+    assert.equal(result.verifications.length, 13)
+    assert.ok(result.verifications.every((item) => item.status === 'VERIFIED'))
+    assert.equal(result.sources.length, 13)
   } finally {
     globalThis.fetch = originalFetch
   }
@@ -1245,6 +1915,46 @@ test('emits strict OpenAI text, reasoning, and fragmented tool-call blocks with 
   const tool = chunks.find((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call')
   assert.deepEqual(tool.block, { type: 'tool-call', id: 'call_1', name: 'read', arguments: '{"path":"README.md"}' })
   assert.deepEqual(chunks.at(-1), { type: 'finish', reason: { kind: 'tool-calls' } })
+})
+
+test('compacts a completed long research response before exposing it to dsh', async () => {
+  const packet = [
+    'Claim verification evidence packet',
+    '',
+    'Sources (citation whitelist; copy URLs exactly):',
+    '[S1] https://official.example/report — Official report [url_context]',
+    '',
+    'Verification outcomes:',
+    '[V1] PARTIAL: Only the date is supported.',
+    '  Sources: S1',
+  ].join('\n')
+  const longDraft = `# Research report\n\n${'material claim '.repeat(200)}`
+  const messages = [
+    { role: 'user', content: [{ type: 'text', text: '查最新情况，写一篇研究性文章' }] },
+    { role: 'assistant', content: [{ type: 'tool-call', id: 'write-report', name: 'write', arguments: JSON.stringify({ file_path: 'outputs/report.md', content: longDraft }) }] },
+    { role: 'user', content: [{ type: 'tool-result', toolCallId: 'write-report', content: [{ type: 'text', text: 'Wrote outputs/report.md.' }], isError: false }] },
+    { role: 'assistant', content: [{ type: 'tool-call', id: 'verify-1', name: 'gemini_verify_claims', arguments: '{"claims":[]}' }] },
+    { role: 'user', content: [{ type: 'tool-result', toolCallId: 'verify-1', content: [{ type: 'text', text: packet }], isError: false }] },
+    { role: 'assistant', content: [{ type: 'tool-call', id: 'todo-1', name: 'todo_write', arguments: '{"todos":[{"content":"deliver","status":"completed"}]}' }] },
+    { role: 'user', content: [{ type: 'tool-result', toolCallId: 'todo-1', content: [{ type: 'text', text: 'Updated todo list: 0 pending, 0 in progress, 1 completed.' }], isError: false }] },
+  ]
+  const raw = `已完成。\n\n\`outputs/report.docx\`\n\n# 正文\n\n${'正文'.repeat(2_000)}\n\n# 事实核查表\n\n<execute_bash>旧任务计划</execute_bash>`
+  const event = { choices: [{ delta: { content: raw }, finish_reason: 'stop' }] }
+  const { chunks } = await collectMockedStream(streamResponse([`data: ${JSON.stringify(event)}\n\ndata: [DONE]\n\n`]), {
+    model: 'gemini-test',
+    messages,
+    tools: [
+      { name: 'gemini_verify_claims', description: 'verify', parameters: { type: 'object' } },
+      { name: 'write', description: 'write', parameters: { type: 'object' } },
+      { name: 'todo_write', description: 'update structured task list', parameters: { type: 'object', properties: { todos: { type: 'array', items: { type: 'object' } } } } },
+    ],
+  })
+  validateStrictStream(chunks)
+  const text = chunks.find((chunk) => chunk.type === 'block-end' && chunk.block.type === 'text').block.text
+  assert.match(text, /独立事实核查表尚未成功写入文件/)
+  assert.match(text, /outputs\/report\.docx/)
+  assert.doesNotMatch(text, /execute_bash|# 正文/)
+  assert.ok(text.length < 1_000)
 })
 
 test('applies runtime sandbox and glob repairs through the streaming adapter', async () => {
@@ -1446,6 +2156,34 @@ test('emits at most one Gemini native search call per model response', async () 
   assert.match(query, /^first/)
   assert.match(query, /Relative-time wording from the user: "current"/)
   assert.doesNotMatch(query, /Exact requested rolling window/)
+})
+
+test('applies the external web fallback guard through the streaming adapter', async () => {
+  const event = {
+    choices: [{ delta: { tool_calls: [{
+      index: 0,
+      id: 'shell_1',
+      function: { name: 'pwsh', arguments: JSON.stringify({ command: 'python -c "import urllib.request; print(urllib.request.urlopen(\'https://example.com\').read())"' }) },
+    }] }, finish_reason: 'tool_calls' }],
+  }
+  const { chunks } = await collectMockedStream(streamResponse([`data: ${JSON.stringify(event)}\n\ndata: [DONE]\n\n`]), {
+    model: 'gemini-test',
+    messages: [
+      { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '核实最近消息' }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'search_1', name: 'gemini_web_search', arguments: '{"query":"latest"}' }] },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'search_1', content: [{ type: 'text', text: 'HTTP 429 rate limit' }], isError: true }] },
+    ],
+    tools: [
+      { name: 'gemini_web_search', parameters: { type: 'object', properties: { query: { type: 'string' } } } },
+      { name: 'pwsh', parameters: { type: 'object', properties: { command: { type: 'string' }, description: { type: 'string' } } } },
+    ],
+  })
+
+  validateStrictStream(chunks)
+  const call = chunks.find((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call')?.block
+  assert.equal(call.name, 'pwsh')
+  const args = JSON.parse(call.arguments)
+  assert.match(args.command, /External web fallback through PowerShell is disabled/)
 })
 
 test('preserves native function-call thought signatures without swallowing conversion errors', async () => {

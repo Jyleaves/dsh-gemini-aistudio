@@ -7,6 +7,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-08-27
+
+### Added
+
+- Add `gemini_verify_claims`, a second-pass evidence tool that reopens only exact
+  URLs returned by prior Gemini-grounded searches and reports unsupported,
+  partial, conflicting, or unreachable claims before delivery.
+
+### Changed
+
+- Stop replaying prior private reasoning text into later Gemini requests while
+  retaining visible live reasoning and native function-call thought signatures,
+  preventing quadratic context growth and old planning text resurfacing.
+- Render compact, stable source and claim identifiers instead of repeating the
+  provider's full synthesis, reducing long research-turn context growth.
+- Compact completed long-form research responses to truthful artifact paths and
+  structured verification counts instead of repeating the full report and
+  fact-check table in chat.
+- Require a fresh successful claim-verification pass after every newer grounded
+  lookup before research write or edit tools become available.
+- Verify long research deliverables against a complete material-claim inventory
+  instead of a small representative sample. Claim verification now accepts up
+  to 48 atomic claims and processes them in small sequential URL Context
+  batches; fact-check tables must map every submitted claim to an exact source
+  URL and verification status.
+- Require a post-draft verification pass after a long research document is
+  written or edited, and require a separate Markdown fact-check artifact before
+  the research goal can be completed.
+- Keep verification gates active when dsh injects runtime snapshots, system
+  reminders, or expanded skills as user-role messages.
+- Allow native Google Search calls up to four minutes and multi-batch claim
+  verification up to fifteen minutes.
+
+### Fixed
+
+- Block PowerShell, Python, curl, and similar external-web fallbacks after a
+  Gemini native search failure while preserving local commands and localhost
+  requests. The blocked tool is removed after the first attempt so a model
+  cannot silently replace grounded Google Search with an unrelated search
+  engine or unverified shell scraping.
+- Remove edit-only `objective` and `max_goal_rounds` fields from `update_goal`
+  completion and blocking calls.
+- Preserve parent JSON Schema constraints while normalizing `anyOf` and `oneOf`
+  variants.
+- Share newly grounded sources directly across live search and verification
+  tool calls, avoiding stale dsh message snapshots that rejected valid URLs.
+- Preserve already-whitelisted URL Context inputs when AI Studio returns
+  verification text without repeating source metadata; ordinary web search
+  remains strict and still rejects ungrounded prose.
+- Aggregate grounded sources across the full turn and prevent research file
+  writes from introducing citation URLs that were neither returned by Gemini
+  grounding nor supplied by the user.
+- Reject source-only or placeholder URL Context responses that omit explicit
+  per-claim verification statuses, accept provider statuses in concise or
+  Markdown multi-line layouts, repair only uniquely identifiable one- or
+  two-character streaming corruption in Google grounding redirect URLs, and
+  downgrade misleading verified labels when a written citation is outside the
+  grounded source whitelist.
+- Reconcile translated fact-check rows with structured verification outcomes
+  by matching the row ordinal (`1`, `2`, ...) to `V1`, `V2`, ... together with
+  the same exact verified URL, avoiding contradictory UNVERIFIED labels when
+  the prose language differs from the provider's verification sentence.
+- Preserve the latest structured claim-verification statuses in fact-check
+  files, downgrade claims that were not fully verified, and append omitted
+  canonical outcomes.
+- Strip streamed JSON suffixes only after a complete Google grounding redirect
+  token and still require an exact source-whitelist match.
+
+### Tests
+
+- Add regressions for strict verification schemas, live-agent source sharing,
+  multi-search source aggregation, citation whitelisting, compact evidence
+  rendering, URL Context-only verification, typo repair, false-verification
+  rejection, safe verification batching, and fresh-verification gating.
+- Add regressions for injected runtime/skill messages and for fact-check rows
+  that combine `VERIFIED / 已核`, claim exact support without an exact verified
+  URL, or retain affirmative prose after being downgraded.
+- Add regressions for reasoning-history compaction, research artifact gates,
+  final-response compaction, `update_goal` repair, and blocked external-web
+  shell fallback. The complete automated suite passes 103 tests.
+- Verify that dsh restarts from the source Junction and serves the Web UI on
+  `127.0.0.1:3080`; live grounded-article completion remains dependent on
+  available upstream AI Studio quota.
+
 ## [0.1.9] - 2026-08-26
 
 ### Changed

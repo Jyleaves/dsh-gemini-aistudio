@@ -1,6 +1,6 @@
 {
   "name": "dsh-gemini-aistudio",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "Native Gemini provider for DeepSeek Harness, with native image attachments, PDF input, tools, and reasoning controls.",
   "private": false,
   "type": "module",
